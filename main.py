@@ -51,7 +51,7 @@ CÓMO HABLAR:
 - Conciso: 2-4 oraciones máximo. La voz humana se aburre si hablas más de 30 segundos.
 - Ve al grano: empieza con la respuesta, sin "claro que sí, déjame revisar".
 - Números deletreados: "potencia sesenta por ciento" (mejor que "60%") porque te leerán en voz.
-- Saludo personalizado si conoces el nombre del cliente.
+- Saluda por su nombre SOLO en el primer mensaje de la conversación. Si ya vienen mensajes previos en el historial, NO vuelvas a saludar ni repitas su nombre en cada respuesta — suena repetitivo y robótico. Responde directo, como en una charla que ya empezó.
 - Usa la "ñ" correctamente. NO uses emojis ni símbolos (te leerán en voz).
 - TEXTO PLANO HABLADO: nunca uses markdown. NADA de asteriscos, negritas, viñetas, almohadillas ni listas numeradas (nada de "1." "2." "3."). Te van a ESCUCHAR, no leer.
 - Si tienes que dar pasos, encadénalos hablando natural: "Primero limpia el lente, después revisa el espejo, y por último prueba un corte" — no como lista.
@@ -95,8 +95,13 @@ PERSONALIDAD ADICIONAL:
 # ───────────────────────────────────────────────────────────────
 # /chat
 # ───────────────────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     message: str
+    history: Optional[list[ChatMessage]] = []
     machine_id: Optional[str] = "DEMO-9060-001"
     customer_name: Optional[str] = "Carlos"
     customer_city: Optional[str] = "Bogotá"
@@ -108,9 +113,25 @@ async def chat(req: ChatRequest):
     if not api_key:
         return JSONResponse({"error": "ANTHROPIC_API_KEY no configurada"}, status_code=500)
 
-    context_line = (f"Contexto del cliente: {req.customer_name} en {req.customer_city}, {req.customer_country}. "
-                    f"Su máquina C4V Laser SN {req.machine_id}.")
-    user_msg = f"{context_line}\n\nPregunta: {req.message}"
+    # Contexto del cliente va en el system (no en cada turno) para no repetirlo.
+    history = req.history or []
+    is_first = len(history) == 0
+    system = (
+        SYSTEM_PROMPT
+        + f"\n\nCONTEXTO DEL CLIENTE ACTUAL: {req.customer_name} en {req.customer_city}, "
+        + f"{req.customer_country}. Su máquina C4V Laser SN {req.machine_id}."
+        + ("\nEs el PRIMER mensaje: puedes saludarlo por su nombre una vez."
+           if is_first else
+           "\nYA HAY conversación en curso: NO saludes de nuevo ni repitas su nombre, responde directo.")
+    )
+
+    # Construir messages = historial previo + mensaje actual (últimos 8 turnos)
+    messages = []
+    for m in history[-8:]:
+        role = m.role if m.role in ("user", "assistant") else "user"
+        if m.content:
+            messages.append({"role": role, "content": m.content})
+    messages.append({"role": "user", "content": req.message})
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -125,8 +146,8 @@ async def chat(req: ChatRequest):
                     "model": LLM_MODEL,
                     "max_tokens": LLM_MAX_TOKENS,
                     "temperature": LLM_TEMPERATURE,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": user_msg}],
+                    "system": system,
+                    "messages": messages,
                 }
             )
             r.raise_for_status()
