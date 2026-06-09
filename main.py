@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import edge_tts
+import odoo_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("cevi")
@@ -106,6 +107,53 @@ class ChatRequest(BaseModel):
     customer_name: Optional[str] = "Carlos"
     customer_city: Optional[str] = "Bogotá"
     customer_country: Optional[str] = "Colombia"
+    customer_id: Optional[int] = None   # id del contacto en Odoo (lo cachea el frontend)
+
+# Herramienta que Claude puede invocar para escalar a soporte humano (crea ticket Odoo)
+TICKET_TOOL = {
+    "name": "crear_ticket_soporte",
+    "description": (
+        "Crea un ticket de soporte técnico para que un humano de C4V contacte al cliente. "
+        "Úsalo SOLO cuando: no puedas resolver el problema tú misma, el cliente pida hablar "
+        "con soporte/un humano, o haya una falla seria de la máquina. No lo uses para preguntas "
+        "que ya respondes tú."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "asunto": {"type": "string", "description": "Título corto del problema."},
+            "detalle": {"type": "string", "description": "Descripción del problema y contexto del cliente."},
+        },
+        "required": ["asunto", "detalle"],
+    },
+}
+
+ANTHROPIC_HEADERS = lambda key: {
+    "x-api-key": key,
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+}
+
+
+async def _call_claude(client, key, system, messages, use_tools):
+    payload = {
+        "model": LLM_MODEL,
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": LLM_TEMPERATURE,
+        "system": system,
+        "messages": messages,
+    }
+    if use_tools:
+        payload["tools"] = [TICKET_TOOL]
+    r = await client.post("https://api.anthropic.com/v1/messages",
+                          headers=ANTHROPIC_HEADERS(key), json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+def _text_of(data):
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -113,7 +161,6 @@ async def chat(req: ChatRequest):
     if not api_key:
         return JSONResponse({"error": "ANTHROPIC_API_KEY no configurada"}, status_code=500)
 
-    # Contexto del cliente va en el system (no en cada turno) para no repetirlo.
     history = req.history or []
     is_first = len(history) == 0
     system = (
@@ -125,7 +172,6 @@ async def chat(req: ChatRequest):
            "\nYA HAY conversación en curso: NO saludes de nuevo ni repitas su nombre, responde directo.")
     )
 
-    # Construir messages = historial previo + mensaje actual (últimos 8 turnos)
     messages = []
     for m in history[-8:]:
         role = m.role if m.role in ("user", "assistant") else "user"
@@ -133,34 +179,55 @@ async def chat(req: ChatRequest):
             messages.append({"role": role, "content": m.content})
     messages.append({"role": "user", "content": req.message})
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    use_tools = odoo_client.enabled()
+    ticket_info = None
+    partner_id = req.customer_id
+
+    async with httpx.AsyncClient(timeout=40.0) as client:
         try:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": LLM_MODEL,
-                    "max_tokens": LLM_MAX_TOKENS,
-                    "temperature": LLM_TEMPERATURE,
-                    "system": system,
-                    "messages": messages,
-                }
-            )
-            r.raise_for_status()
-            data = r.json()
-            response_text = data["content"][0]["text"].strip()
-            log.info(f"Q: {req.message[:60]!r} → A: {response_text[:80]!r}")
-            return {"response": response_text, "model": LLM_MODEL}
+            data = await _call_claude(client, api_key, system, messages, use_tools)
+
+            # Una ronda de tool-use: si Claude pide crear ticket, lo creamos en Odoo.
+            if data.get("stop_reason") == "tool_use":
+                tool_results = []
+                for block in data.get("content", []):
+                    if block.get("type") == "tool_use" and block.get("name") == "crear_ticket_soporte":
+                        inp = block.get("input", {})
+                        try:
+                            partner_id = odoo_client.ensure_partner(req.customer_name, req.customer_country, partner_id)
+                            t = odoo_client.create_ticket(partner_id, inp.get("asunto", "Soporte CeVi"), inp.get("detalle", ""))
+                            ticket_info = t
+                            result_txt = (f"Ticket de soporte creado. Referencia {t['ref']}. "
+                                          f"Dile al cliente que un asesor de C4V lo contactará.")
+                            log.info("Ticket Odoo creado: %s (partner %s)", t, partner_id)
+                        except Exception:
+                            log.exception("Error creando ticket Odoo")
+                            result_txt = ("No se pudo crear el ticket ahora. Pídele al cliente que escriba "
+                                          "al soporte +51 924 662 205 por WhatsApp.")
+                        tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": result_txt})
+                messages.append({"role": "assistant", "content": data["content"]})
+                messages.append({"role": "user", "content": tool_results})
+                data = await _call_claude(client, api_key, system, messages, use_tools)
+
+            response_text = _text_of(data) or "Disculpa, no te entendí. ¿Lo repites?"
+            log.info("Q: %r → A: %r", req.message[:60], response_text[:80])
+
         except httpx.HTTPStatusError as e:
-            log.error(f"Anthropic HTTP {e.response.status_code}: {e.response.text[:300]}")
+            log.error("Anthropic HTTP %s: %s", e.response.status_code, e.response.text[:300])
             return JSONResponse({"error": f"LLM HTTP {e.response.status_code}"}, status_code=500)
         except Exception as e:
             log.exception("Chat error")
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # Registrar la interacción en Odoo (best-effort: si falla, no rompe el chat)
+    if odoo_client.enabled():
+        try:
+            partner_id = odoo_client.ensure_partner(req.customer_name, req.customer_country, partner_id)
+            odoo_client.log_note(partner_id, req.message, response_text)
+        except Exception:
+            log.exception("Error registrando interacción en Odoo")
+
+    return {"response": response_text, "model": LLM_MODEL, "ticket": ticket_info, "partner_id": partner_id}
 
 
 # ───────────────────────────────────────────────────────────────
@@ -203,6 +270,7 @@ async def health():
         "model": LLM_MODEL,
         "voice": TTS_VOICE,
         "has_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "odoo": odoo_client.enabled(),
     }
 
 
