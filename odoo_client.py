@@ -13,7 +13,9 @@ Si faltan, enabled() es False y el backend simplemente NO toca Odoo
 (el chat sigue funcionando igual).
 """
 import os
+import re
 import ssl
+import time
 import logging
 import threading
 import xmlrpc.client
@@ -132,3 +134,54 @@ def create_ticket(partner_id, subject, detail):
     except Exception:
         pass
     return {"id": tid, "ref": ref or str(tid)}
+
+
+# ── Anti fuerza bruta: máx 6 intentos por pedido en 10 min ──
+_attempts = {}
+def _too_many(order):
+    now = time.time()
+    arr = [t for t in _attempts.get(order, []) if now - t < 600]
+    _attempts[order] = arr
+    return len(arr) >= 6
+def _note_fail(order):
+    _attempts.setdefault(order, []).append(time.time())
+
+
+def identify_by_order(order_name, verify):
+    """Identifica al cliente por N° de pedido (S#####) + verificación (últimos 4
+    dígitos de teléfono O DNI/RUC). Devuelve {partner_id,name,order,machine,country}
+    o None (genérico, sin revelar qué falló). Anti fuerza bruta por pedido."""
+    _connect()
+    order_name = (order_name or "").strip().upper()
+    if not order_name or _too_many(order_name):
+        return None
+    oids = _ex("sale.order", "search", [["name", "=", order_name]], limit=1)
+    if not oids:
+        _note_fail(order_name)
+        return None
+    o = _ex("sale.order", "read", [oids[0]], fields=["partner_id", "order_line"])[0]
+    if not o.get("partner_id"):
+        _note_fail(order_name)
+        return None
+    pid = o["partner_id"][0]
+    p = _ex("res.partner", "read", [pid], fields=["name", "phone", "vat", "country_id"])[0]
+    last4 = re.sub(r"\D", "", verify or "")[-4:]
+    dphone = re.sub(r"\D", "", p.get("phone") or "")
+    dvat = re.sub(r"\D", "", p.get("vat") or "")
+    if not last4 or (last4 != dphone[-4:] and last4 != dvat[-4:]):
+        _note_fail(order_name)
+        return None
+    machine = None
+    if o.get("order_line"):
+        for ln in _ex("sale.order.line", "read", o["order_line"], fields=["name"]):
+            nm = ln.get("name") or ""
+            if any(k in nm.lower() for k in ["laser", "machine", "tec", "pro", "co2", "fibra"]):
+                machine = nm.split("]")[-1].strip().split("\n")[0][:60]
+                break
+    return {
+        "partner_id": pid,
+        "name": p.get("name") or "Cliente",
+        "order": order_name,
+        "machine": machine,
+        "country": (p["country_id"][1] if p.get("country_id") else ""),
+    }

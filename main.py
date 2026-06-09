@@ -231,6 +231,28 @@ async def chat(req: ChatRequest):
 
 
 # ───────────────────────────────────────────────────────────────
+# /identify — reconoce al cliente por N° de pedido + verificación
+# ───────────────────────────────────────────────────────────────
+class IdentifyRequest(BaseModel):
+    order: str
+    verify: Optional[str] = ""
+
+@app.post("/identify")
+async def identify(req: IdentifyRequest):
+    if not odoo_client.enabled():
+        return {"ok": False, "error": "La identificación no está disponible por ahora."}
+    try:
+        info = odoo_client.identify_by_order(req.order, req.verify)
+    except Exception:
+        log.exception("identify error")
+        return {"ok": False, "error": "Hubo un error al verificar. Intenta de nuevo."}
+    if not info:
+        return {"ok": False, "error": "Número de pedido o verificación incorrectos."}
+    log.info("Identificado pedido %s → partner %s", info["order"], info["partner_id"])
+    return {"ok": True, **info}
+
+
+# ───────────────────────────────────────────────────────────────
 # /tts
 # ───────────────────────────────────────────────────────────────
 class TTSRequest(BaseModel):
