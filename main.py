@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
+import json
 import edge_tts
 import odoo_client
 
@@ -49,7 +50,9 @@ SYSTEM_PROMPT = """Eres CeVi, el asistente de voz integrado en cada máquina lá
 CÓMO HABLAR:
 - Español neutro latinoamericano con TUTEO (tú / tu), tono cálido, amigable, optimista. Nunca formal ni robótico.
 - DIALECTO (importante): usa tuteo neutro: "limpia", "revisa", "haz", "prueba", "empieza", "quieres", "puedes". NUNCA voseo argentino ("limpiá", "revisá", "hacé", "probá", "querés", "tenés", "sos"). C4V es una empresa peruana y tu voz es mexicana.
-- Conciso: 2-4 oraciones máximo. La voz humana se aburre si hablas más de 30 segundos.
+- Conciso: 2 oraciones, menos de 40 palabras. Te ESCUCHAN por el teléfono, muchas veces en un taller con ruido: una respuesta larga no se retiene.
+- TERMINA SIEMPRE ofreciendo el siguiente paso o dos opciones concretas, para que la persona sepa qué decir después. Nunca cierres sin salida.
+- Si no sabes algo, si el cliente se enreda, o si el tema es delicado (garantía, dinero, un daño), ofrece pasar con una persona por WhatsApp. Nunca inventes potencias, tiempos ni números de serie.
 - Ve al grano: empieza con la respuesta, sin "claro que sí, déjame revisar".
 - Números deletreados: "potencia sesenta por ciento" (mejor que "60%") porque te leerán en voz.
 - Saluda por su nombre SOLO en el primer mensaje de la conversación. Si ya vienen mensajes previos en el historial, NO vuelvas a saludar ni repitas su nombre en cada respuesta — suena repetitivo y robótico. Responde directo, como en una charla que ya empezó.
@@ -228,6 +231,115 @@ async def chat(req: ChatRequest):
             log.exception("Error registrando interacción en Odoo")
 
     return {"response": response_text, "model": LLM_MODEL, "ticket": ticket_info, "partner_id": partner_id}
+
+
+# ───────────────────────────────────────────────────────────────
+# /chat/stream — la misma respuesta, pero frase a frase
+# ───────────────────────────────────────────────────────────────
+# El cliente esperaba a que Claude terminara de escribir ENTERO antes de poder
+# sintetizar la primera palabra: 2,1-2,5 s de silencio. Con SSE la web recibe
+# cada frase en cuanto está lista y la manda a voz mientras el modelo sigue
+# escribiendo. Va sobre HTTP normal, sin WebSocket, así que Railway no cambia.
+#
+# /chat NO se toca: sigue existiendo igual para ManyChat y para cualquier
+# cliente que no sepa de streaming.
+
+def _sse(evento: str, datos: dict) -> str:
+    return f"event: {evento}\ndata: {json.dumps(datos, ensure_ascii=False)}\n\n"
+
+
+async def _stream_claude(client, key, system, messages):
+    """Emite el texto de Claude a trozos, según llega."""
+    payload = {
+        "model": LLM_MODEL,
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": LLM_TEMPERATURE,
+        "system": system,
+        "messages": messages,
+        "stream": True,
+    }
+    async with client.stream("POST", "https://api.anthropic.com/v1/messages",
+                             headers=ANTHROPIC_HEADERS(key), json=payload) as r:
+        r.raise_for_status()
+        async for linea in r.aiter_lines():
+            if not linea.startswith("data:"):
+                continue
+            cuerpo = linea[5:].strip()
+            if not cuerpo or cuerpo == "[DONE]":
+                continue
+            try:
+                ev = json.loads(cuerpo)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "content_block_delta":
+                trozo = ev.get("delta", {}).get("text", "")
+                if trozo:
+                    yield trozo
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY no configurada"}, status_code=500)
+
+    history = req.history or []
+    is_first = len(history) == 0
+    system = (
+        SYSTEM_PROMPT
+        + f"\n\nCONTEXTO DEL CLIENTE ACTUAL: {req.customer_name} en {req.customer_city}, "
+        + f"{req.customer_country}. Su máquina C4V Laser SN {req.machine_id}."
+        + ("\nEs el PRIMER mensaje: puedes saludarlo por su nombre una vez."
+           if is_first else
+           "\nYA HAY conversación en curso: NO saludes de nuevo ni repitas su nombre, responde directo.")
+    )
+
+    messages = []
+    for m in history[-8:]:
+        role = m.role if m.role in ("user", "assistant") else "user"
+        if m.content:
+            messages.append({"role": role, "content": m.content})
+    messages.append({"role": "user", "content": req.message})
+
+    # Sin herramientas en el camino con streaming: crear un ticket obliga a una
+    # segunda vuelta al modelo y rompería el flujo frase a frase. Si hace falta
+    # ticket, la web puede llamar a /chat, que sí las usa.
+    async def generar():
+        completo = []
+        buffer = ""
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                async for trozo in _stream_claude(client, api_key, system, messages):
+                    completo.append(trozo)
+                    buffer += trozo
+                    # Se corta por final de frase: es la unidad que el TTS
+                    # pronuncia con entonación correcta.
+                    while True:
+                        corte = -1
+                        for signo in ".?!…":
+                            i = buffer.find(signo)
+                            if i != -1 and (corte == -1 or i < corte):
+                                corte = i
+                        if corte == -1 or corte + 1 < 25:
+                            break
+                        frase = buffer[:corte + 1].strip()
+                        buffer = buffer[corte + 1:]
+                        if frase:
+                            yield _sse("frase", {"texto": frase})
+                if buffer.strip():
+                    yield _sse("frase", {"texto": buffer.strip()})
+            texto = "".join(completo).strip() or "Disculpa, no te entendí. ¿Lo repites?"
+            log.info("Q: %r → A(stream): %r", req.message[:60], texto[:80])
+            yield _sse("fin", {"texto": texto, "model": LLM_MODEL})
+        except Exception as e:
+            log.exception("Chat stream error")
+            yield _sse("error", {"error": str(e)})
+
+    return StreamingResponse(
+        generar(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 # ───────────────────────────────────────────────────────────────
