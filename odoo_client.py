@@ -5,6 +5,9 @@ Escribe en el Odoo de C4V (erp.c4vlaser.com):
   - busca/crea el contacto del cliente (res.partner), etiquetado "CeVi Demo"
   - registra cada conversación como nota en la ficha del cliente
   - crea tickets de Helpdesk (equipo "CeVi", etiqueta "CeVi Demo")
+  - (18-set-2026) busca clientes REALES por teléfono y crea tickets reales
+    etiquetados "CeVi Voz", para las tools del agente de voz ElevenLabs
+    (ver buscar_por_telefono / crear_ticket_voz más abajo)
 
 Variables de entorno (Railway):
   ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD
@@ -30,13 +33,19 @@ ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD")
 # Separación de datos demo (decisión 2026-06-09: equipo + etiqueta "CeVi Demo")
 TEAM_NAME = "CeVi"
 DEMO_TAG = "CeVi Demo"
+# Datos REALES creados por el agente de voz de ElevenLabs (decisión 18-set-2026):
+# etiqueta propia para distinguirlos de los de prueba, mismo equipo de Helpdesk.
+VOZ_TAG = "CeVi Voz"
 
 _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
 _ctx.verify_mode = ssl.CERT_NONE
 
 _lock = threading.Lock()
-_state = {"uid": None, "models": None, "team_id": None, "hd_tag_id": None, "cat_id": None}
+_state = {
+    "uid": None, "models": None, "team_id": None, "hd_tag_id": None, "cat_id": None,
+    "voz_tag_id": None,
+}
 
 
 def enabled() -> bool:
@@ -76,6 +85,7 @@ def _ensure_setup():
     _state["team_id"] = _find_or_create("helpdesk.team", [["name", "=", TEAM_NAME]], {"name": TEAM_NAME})
     _state["hd_tag_id"] = _find_or_create("helpdesk.tag", [["name", "=", DEMO_TAG]], {"name": DEMO_TAG})
     _state["cat_id"] = _find_or_create("res.partner.category", [["name", "=", DEMO_TAG]], {"name": DEMO_TAG})
+    _state["voz_tag_id"] = _find_or_create("helpdesk.tag", [["name", "=", VOZ_TAG]], {"name": VOZ_TAG})
 
 
 def _esc(s):
@@ -185,3 +195,104 @@ def identify_by_order(order_name, verify):
         "machine": machine,
         "country": (p["country_id"][1] if p.get("country_id") else ""),
     }
+
+
+# ── Tools del agente de voz ElevenLabs (18-set-2026) — clientes y tickets REALES ──
+# A diferencia de ensure_partner/create_ticket (arriba), que son para la demo web
+# ("CeVi Demo"), esto busca en la cartera real de clientes y crea tickets reales,
+# etiquetados "CeVi Voz" para que se distingan en Odoo. Sin WhatsApp automático
+# todavía: el ticket queda visible en el Helpdesk, pero no avisa solo — hace
+# falta que el equipo revise la bandeja (o construir el envío de WhatsApp, A6).
+
+def _extraer_maquinas(order_line_ids):
+    """De líneas de sale.order, devuelve nombres de modelo (heurística: palabras
+    clave de máquina láser), igual que en identify_by_order."""
+    if not order_line_ids:
+        return []
+    maquinas = []
+    for ln in _ex("sale.order.line", "read", order_line_ids, fields=["name"]):
+        nm = ln.get("name") or ""
+        if any(k in nm.lower() for k in ["laser", "láser", "machine", "tec", "pro", "co2", "fibra"]):
+            modelo = nm.split("]")[-1].strip().split("\n")[0][:60]
+            if modelo and modelo not in maquinas:
+                maquinas.append(modelo)
+    return maquinas
+
+
+def buscar_por_telefono(telefono):
+    """Busca un cliente REAL por teléfono (últimos 7 dígitos, sin importar el
+    formato guardado). Devuelve {'partner_id','nombre','pais','maquinas':[...]}
+    o None si no se encuentra."""
+    _connect()
+    dig = re.sub(r"\D", "", telefono or "")
+    if len(dig) < 7:
+        return None
+    sufijo = dig[-7:]
+    ids = _ex(
+        "res.partner", "search",
+        ["|", ["phone", "like", sufijo], ["mobile", "like", sufijo]],
+        limit=5,
+    )
+    if not ids:
+        return None
+    p = _ex("res.partner", "read", ids, fields=["name", "country_id"])[0]
+    pid = p["id"]
+    maquinas = []
+    oids = _ex("sale.order", "search", [["partner_id", "=", pid]], limit=10)
+    if oids:
+        line_ids = []
+        for o in _ex("sale.order", "read", oids, fields=["order_line"]):
+            line_ids += o.get("order_line") or []
+        maquinas = _extraer_maquinas(line_ids)
+    return {
+        "partner_id": pid,
+        "nombre": p.get("name") or "Cliente",
+        "pais": (p["country_id"][1] if p.get("country_id") else ""),
+        "maquinas": maquinas,
+    }
+
+
+def crear_ticket_voz(telefono, descripcion, ya_intento=None, serie=None, urgencia="normal", motivo=None):
+    """Crea un ticket de Helpdesk REAL (equipo 'CeVi', etiqueta 'CeVi Voz') para
+    las tools crear_ticket / derivar_asesor del agente de voz. Si el teléfono no
+    matchea a nadie, crea un contacto mínimo con ese número (no se pierde el caso).
+    Devuelve {'ticket','partner_id'}."""
+    _connect()
+    info = buscar_por_telefono(telefono)
+    if info:
+        pid = info["partner_id"]
+    else:
+        pid = _ex(
+            "res.partner", "create",
+            {
+                "name": f"Cliente CeVi voz ({telefono})",
+                "phone": telefono,
+                "category_id": [(4, _state["cat_id"])],  # comparte la categoría demo: no es cliente verificado
+                "comment": "Creado automáticamente por CeVi (agente de voz) — no se encontró por teléfono en Odoo.",
+            },
+        )
+    detalle = descripcion or ""
+    if motivo:
+        detalle = f"[{motivo}] " + detalle
+    if ya_intento:
+        detalle += f"\n\nYa intentó: {ya_intento}"
+    if serie:
+        detalle += f"\n\nNº de serie mencionado: {serie}"
+    vals = {
+        "name": (descripcion or "Caso desde CeVi voz")[:120],
+        "partner_id": pid,
+        "description": f"<p>{_esc(detalle)}</p><p><i>Generado por CeVi (agente de voz ElevenLabs).</i></p>",
+        "team_id": _state["team_id"],
+        "tag_ids": [(4, _state["voz_tag_id"])],
+    }
+    if urgencia == "alta" and "priority" not in vals:
+        vals["priority"] = "2"
+    tid = _ex("helpdesk.ticket", "create", vals)
+    ref = None
+    try:
+        rec = _ex("helpdesk.ticket", "read", [tid], fields=["ticket_ref"])
+        if rec:
+            ref = rec[0].get("ticket_ref")
+    except Exception:
+        pass
+    return {"ticket": ref or str(tid), "partner_id": pid}

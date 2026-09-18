@@ -13,7 +13,7 @@ Variables de entorno (Railway):
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -350,6 +350,94 @@ async def identify(req: IdentifyRequest):
         return {"ok": False, "error": "Número de pedido o verificación incorrectos."}
     log.info("Identificado pedido %s → partner %s", info["order"], info["partner_id"])
     return {"ok": True, **info}
+
+
+# ───────────────────────────────────────────────────────────────
+# /webhook/* — tools del agente de voz ElevenLabs (CeVi, solo soporte técnico)
+# ───────────────────────────────────────────────────────────────
+# 18-set-2026: estas tools apuntaban a un n8n que nunca se construyó (A6/A9).
+# En vez de esperarlo, se conectan directo a Odoo (mismo cliente XML-RPC que ya
+# usa /chat para crear tickets, ya probado en producción). Sin n8n de por medio,
+# CeVi de voz ya busca clientes reales y crea tickets reales — lo único que NO
+# hace todavía es avisar al asesor por WhatsApp al instante: el ticket queda
+# real y visible en el Helpdesk (etiqueta "CeVi Voz"), pero alguien del equipo
+# tiene que revisar la bandeja. Eso sigue pendiente de n8n/WhatsApp.
+#
+# Protegidos con un secreto compartido (CEVI_WEBHOOK_SECRET) para que no
+# cualquiera en internet pueda crear tickets — ElevenLabs lo manda como header
+# (configurado en el tool_config, ver crear_agente.py).
+
+def _webhook_autorizado(secret_header: Optional[str]) -> bool:
+    esperado = os.environ.get("CEVI_WEBHOOK_SECRET")
+    if not esperado:
+        # Sin secreto configurado, no se cierra el paso (evita romper en el primer
+        # despliegue) pero queda anotado en el log para no olvidarlo.
+        log.warning("CEVI_WEBHOOK_SECRET no configurada — webhooks de voz sin protección")
+        return True
+    return secret_header == esperado
+
+
+class BuscarClienteReq(BaseModel):
+    telefono: str
+
+@app.post("/webhook/buscar-cliente")
+async def webhook_buscar_cliente(req: BuscarClienteReq, x_cevi_secret: Optional[str] = Header(None, alias="X-CeVi-Secret")):
+    if not _webhook_autorizado(x_cevi_secret):
+        return JSONResponse({"error": "no autorizado"}, status_code=401)
+    if not odoo_client.enabled():
+        return {"registrado": False}
+    try:
+        info = odoo_client.buscar_por_telefono(req.telefono)
+    except Exception:
+        log.exception("buscar_cliente (voz) error")
+        return {"registrado": False}
+    if not info:
+        return {"registrado": False}
+    return {"registrado": True, "nombre": info["nombre"], "pais": info["pais"], "maquinas": info["maquinas"]}
+
+
+class CrearTicketReq(BaseModel):
+    telefono: str
+    descripcion: str
+    ya_intento: Optional[str] = None
+    serie: Optional[str] = None
+    urgencia: Optional[str] = "normal"
+
+@app.post("/webhook/crear-ticket")
+async def webhook_crear_ticket(req: CrearTicketReq, x_cevi_secret: Optional[str] = Header(None, alias="X-CeVi-Secret")):
+    if not _webhook_autorizado(x_cevi_secret):
+        return JSONResponse({"error": "no autorizado"}, status_code=401)
+    if not odoo_client.enabled():
+        return {"ticket": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
+    try:
+        r = odoo_client.crear_ticket_voz(
+            req.telefono, req.descripcion, ya_intento=req.ya_intento, serie=req.serie, urgencia=req.urgencia or "normal",
+        )
+    except Exception:
+        log.exception("crear_ticket (voz) error")
+        return {"ticket": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
+    return {"ticket": r["ticket"], "asignado_a": None, "mensaje_cliente": "Te contactamos por WhatsApp en cuanto un técnico revise el caso."}
+
+
+class DerivarAsesorReq(BaseModel):
+    telefono: str
+    motivo: str
+    resumen: str
+
+@app.post("/webhook/derivar-asesor")
+async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[str] = Header(None, alias="X-CeVi-Secret")):
+    if not _webhook_autorizado(x_cevi_secret):
+        return JSONResponse({"error": "no autorizado"}, status_code=401)
+    if not odoo_client.enabled():
+        return {"asesor": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
+    try:
+        r = odoo_client.crear_ticket_voz(
+            req.telefono, req.resumen, urgencia="alta" if req.motivo == "seguridad" else "normal", motivo=req.motivo,
+        )
+    except Exception:
+        log.exception("derivar_asesor (voz) error")
+        return {"asesor": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
+    return {"asesor": None, "mensaje_cliente": "Un asesor de C4V te escribe por WhatsApp en cuanto revise tu caso."}
 
 
 # ───────────────────────────────────────────────────────────────
