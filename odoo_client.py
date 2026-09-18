@@ -228,11 +228,10 @@ def buscar_por_telefono(telefono):
     if len(dig) < 7:
         return None
     sufijo = dig[-7:]
-    ids = _ex(
-        "res.partner", "search",
-        ["|", ["phone", "like", sufijo], ["mobile", "like", sufijo]],
-        limit=5,
-    )
+    # Este Odoo (v19) eliminó res.partner.mobile — solo "phone" existe de verdad
+    # (mismo hallazgo que ya forzó a sync-contactos.js a detectar el campo en
+    # runtime). Buscar por "mobile" tira ValueError de Odoo, no vacío.
+    ids = _ex("res.partner", "search", [["phone", "like", sufijo]], limit=5)
     if not ids:
         return None
     p = _ex("res.partner", "read", ids, fields=["name", "country_id"])[0]
