@@ -438,8 +438,8 @@ def _empresa_de_maquina(maquina):
 
 def crear_oportunidad_voz(nombre, cuerpo_html, partner_id=None, telefono=None, pais="PE", maquina=None,
                           origen="CeVi soporte"):
-    """Consulta comercial → oportunidad en el CRM (etapa New, sin asignar), en
-    el equipo de ventas del país, como las que cargan los asesores. `origen` va
+    """Consulta comercial → oportunidad en el CRM (etapa New, asignada al líder
+    del equipo de ventas del país), como las que cargan los asesores. `origen` va
     como fuente (utm.source) para distinguir de dónde vino ("CeVi soporte",
     "CeVi web ventas"). Devuelve {'ticket', 'partner_id'}."""
     _connect()
@@ -447,8 +447,14 @@ def crear_oportunidad_voz(nombre, cuerpo_html, partner_id=None, telefono=None, p
     pais = (pais or "PE").upper()[:2]
     emp_maq = _empresa_de_maquina(maquina)
     empresa = CRM_EMPRESA.get(pais) or (emp_maq if emp_maq in (1, 13) else 1)
-    vals = {"name": nombre, "type": "opportunity", "partner_id": pid, "team_id": CRM_EQUIPO.get(pais, 5),
-            "company_id": empresa, "user_id": False, "description": cuerpo_html}
+    equipo = CRM_EQUIPO.get(pais, 5)
+    # El tablero del CRM abre filtrado por "asignadas a mí" y no hay asignación
+    # automática: sin responsable, ninguna vendedora la vería. Va al líder del
+    # equipo de ventas (en Perú, Jose), que la reparte; si no tiene, sin asignar.
+    lider = _ex("crm.team", "read", [equipo], fields=["user_id"])
+    responsable = (lider[0].get("user_id") or [False])[0] if lider else False
+    vals = {"name": nombre, "type": "opportunity", "partner_id": pid, "team_id": equipo,
+            "company_id": empresa, "user_id": responsable, "description": cuerpo_html}
     fuente = _origen_crm(origen) if not SIMULAR else None
     if fuente:
         vals["source_id"] = fuente
