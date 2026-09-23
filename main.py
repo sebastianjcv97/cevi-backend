@@ -62,7 +62,7 @@ QUÉ SABES:
 - Soporte: +51 924 662 205 (WhatsApp Perú) / 905474440 (fijo).
 - TikTok @c4vlaser: lives L-V 1pm y 6pm, sáb 11:30am.
 - C4V School: cursos gratis incluidos (parámetros, mantenimiento, RDWorks).
-- Irene Velasco (coach, 35 años, 60K+ comunidad) y Sebastian Contreras (Director). Garantía RECI doble en el tubo. Asesora dedicada por país (PE/EC/BO/CO).
+- Irene Velasco (coach, 35 años, 60K+ comunidad) y Sebastian Contreras (Director). Garantía C4V de 12 meses por la máquina. Asesora dedicada por país (PE/EC/BO/CO).
 
 PARÁMETROS DE CORTE:
 - MDF 3mm: potencia 20-35%, velocidad 15-25 mm/s. Acrílico 5mm: potencia 60%, velocidad 8 mm/s.
@@ -355,89 +355,190 @@ async def identify(req: IdentifyRequest):
 # ───────────────────────────────────────────────────────────────
 # /webhook/* — tools del agente de voz ElevenLabs (CeVi, solo soporte técnico)
 # ───────────────────────────────────────────────────────────────
-# 18-set-2026: estas tools apuntaban a un n8n que nunca se construyó (A6/A9).
-# En vez de esperarlo, se conectan directo a Odoo (mismo cliente XML-RPC que ya
-# usa /chat para crear tickets, ya probado en producción). Sin n8n de por medio,
-# CeVi de voz ya busca clientes reales y crea tickets reales — lo único que NO
-# hace todavía es avisar al asesor por WhatsApp al instante: el ticket queda
-# real y visible en el Helpdesk (etiqueta "CeVi Voz"), pero alguien del equipo
-# tiene que revisar la bandeja. Eso sigue pendiente de n8n/WhatsApp.
-#
-# Protegidos con un secreto compartido (CEVI_WEBHOOK_SECRET) para que no
-# cualquiera en internet pueda crear tickets — ElevenLabs lo manda como header
-# (configurado en el tool_config, ver crear_agente.py).
+# Dos llaves, dos propósitos:
+#  - X-CeVi-Secret (estático): que solo ElevenLabs pueda llamar estos endpoints.
+#  - X-CeVi-Token (por conversación): QUIÉN es el cliente. Lo emite el portal
+#    (POST /api/cevi/token) cuando el cliente ya entró con documento + WhatsApp;
+#    el widget lo pasa como {{secret__cevi_token}} y ElevenLabs lo pone en el
+#    header. El modelo nunca lo ve: aunque diga otro teléfono, las tools solo
+#    ven y tocan los datos de ESE cliente (ver identidad.py).
+# Sin token (el agente usado fuera del portal): se pueden abrir casos, pero
+# quedan "sin verificar" y no se muestran tickets ni garantía de nadie.
+# Avisos al equipo: solo el ticket en el Helpdesk de Odoo (decisión 23-set-2026).
+
+import identidad
+
 
 def _webhook_autorizado(secret_header: Optional[str]) -> bool:
     esperado = os.environ.get("CEVI_WEBHOOK_SECRET")
     if not esperado:
-        # Sin secreto configurado, no se cierra el paso (evita romper en el primer
-        # despliegue) pero queda anotado en el log para no olvidarlo.
         log.warning("CEVI_WEBHOOK_SECRET no configurada — webhooks de voz sin protección")
         return True
     return secret_header == esperado
 
 
+def _cliente(token: Optional[str]):
+    """Ficha del cliente si el token del portal es válido; si no, None."""
+    if not token or token.startswith("{{"):   # variable no sustituida = sin identidad
+        return None
+    return identidad.cliente_de_token(token)
+
+
+def _contexto_maquina(cli) -> str:
+    partes = []
+    for m in identidad.resumen_maquinas(cli.get("maquinas")):
+        partes.append(
+            f"{m['modelo'] or 'modelo sin registrar'} serie {m['serie'] or 'sin registrar'}, "
+            f"certificado {m['certificado']['estado']} {m['certificado']['fecha']}, entrega {m['fecha_entrega']}"
+        )
+    base = f"{cli.get('nombre','')} ({cli.get('pais','')}, tel {cli.get('telefono','')})"
+    return base + (" — " + "; ".join(partes) if partes else "")
+
+
+SIN_ODOO = {"ok": False, "mensaje_cliente": "Se me trabó el sistema. Escríbenos por WhatsApp al 924 662 205 y te atienden directo."}
+SIN_IDENTIDAD = {"ok": False, "identificado": False,
+                 "mensaje_cliente": "Para ver tus casos y tu garantía entra al portal de clientes con tu documento; desde ahí te reconozco."}
+
+X_SECRET = Header(None, alias="X-CeVi-Secret")
+X_TOKEN = Header(None, alias="X-CeVi-Token")
+
+
 class BuscarClienteReq(BaseModel):
-    telefono: str
+    telefono: Optional[str] = None
 
 @app.post("/webhook/buscar-cliente")
-async def webhook_buscar_cliente(req: BuscarClienteReq, x_cevi_secret: Optional[str] = Header(None, alias="X-CeVi-Secret")):
+async def webhook_buscar_cliente(req: BuscarClienteReq, x_cevi_secret: Optional[str] = X_SECRET,
+                                 x_cevi_token: Optional[str] = X_TOKEN):
+    """Quién es el cliente. SOLO con token del portal: sin él no se revela nada
+    (si no, cualquiera podría averiguar quién es cliente dictando teléfonos)."""
     if not _webhook_autorizado(x_cevi_secret):
         return JSONResponse({"error": "no autorizado"}, status_code=401)
-    if not odoo_client.enabled():
-        return {"registrado": False}
+    cli = _cliente(x_cevi_token)
+    if not cli:
+        return {"registrado": False, **SIN_IDENTIDAD}
+    return {"registrado": True, "identificado": True, "nombre": cli["nombre"], "pais": cli["pais"],
+            "maquinas": identidad.resumen_maquinas(cli["maquinas"])}
+
+
+@app.post("/webhook/garantia-certificado")
+async def webhook_garantia(x_cevi_secret: Optional[str] = X_SECRET, x_cevi_token: Optional[str] = X_TOKEN):
+    """Modelo, serie, certificado, fecha de entrega y garantía de SUS máquinas."""
+    if not _webhook_autorizado(x_cevi_secret):
+        return JSONResponse({"error": "no autorizado"}, status_code=401)
+    cli = _cliente(x_cevi_token)
+    if not cli:
+        return SIN_IDENTIDAD
+    maquinas = identidad.resumen_maquinas(cli["maquinas"])
+    if not maquinas:
+        return {"ok": True, "maquinas": [], "mensaje_cliente": "No veo una máquina registrada a tu nombre; te paso con un asesor para revisarlo."}
+    return {"ok": True, "maquinas": maquinas,
+            "nota": "La garantía C4V es de 12 meses por la máquina. La fecha 'hasta' es referencial (contada desde la entrega registrada); cualquier reclamo lo confirma el equipo."}
+
+
+@app.post("/webhook/consultar-tickets")
+async def webhook_consultar_tickets(x_cevi_secret: Optional[str] = X_SECRET, x_cevi_token: Optional[str] = X_TOKEN):
+    """Sus últimos casos de soporte y en qué estado están."""
+    if not _webhook_autorizado(x_cevi_secret):
+        return JSONResponse({"error": "no autorizado"}, status_code=401)
+    cli = _cliente(x_cevi_token)
+    if not cli:
+        return SIN_IDENTIDAD
+    if not cli.get("partner_id") or not odoo_client.enabled():
+        return {"ok": True, "tickets": [], "mensaje_cliente": "No veo casos abiertos a tu nombre."}
     try:
-        info = odoo_client.buscar_por_telefono(req.telefono)
+        tickets = odoo_client.tickets_de_partner(cli["partner_id"])
     except Exception:
-        log.exception("buscar_cliente (voz) error")
-        return {"registrado": False}
-    if not info:
-        return {"registrado": False}
-    return {"registrado": True, "nombre": info["nombre"], "pais": info["pais"], "maquinas": info["maquinas"]}
+        log.exception("consultar_tickets error")
+        return SIN_ODOO
+    return {"ok": True, "tickets": tickets, "abiertos": sum(1 for t in tickets if t["abierto"])}
 
 
 class CrearTicketReq(BaseModel):
-    telefono: str
     descripcion: str
+    telefono: Optional[str] = None
     ya_intento: Optional[str] = None
     serie: Optional[str] = None
     urgencia: Optional[str] = "normal"
 
 @app.post("/webhook/crear-ticket")
-async def webhook_crear_ticket(req: CrearTicketReq, x_cevi_secret: Optional[str] = Header(None, alias="X-CeVi-Secret")):
+async def webhook_crear_ticket(req: CrearTicketReq, x_cevi_secret: Optional[str] = X_SECRET,
+                               x_cevi_token: Optional[str] = X_TOKEN):
     if not _webhook_autorizado(x_cevi_secret):
         return JSONResponse({"error": "no autorizado"}, status_code=401)
     if not odoo_client.enabled():
-        return {"ticket": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
+        return SIN_ODOO
+    cli = _cliente(x_cevi_token)
     try:
         r = odoo_client.crear_ticket_voz(
-            req.telefono, req.descripcion, ya_intento=req.ya_intento, serie=req.serie, urgencia=req.urgencia or "normal",
+            (cli or {}).get("telefono") or req.telefono, req.descripcion, ya_intento=req.ya_intento,
+            serie=req.serie, urgencia=req.urgencia or "normal",
+            partner_id=(cli or {}).get("partner_id"), contexto=_contexto_maquina(cli) if cli else None,
         )
     except Exception:
         log.exception("crear_ticket (voz) error")
-        return {"ticket": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
-    return {"ticket": r["ticket"], "asignado_a": None, "mensaje_cliente": "Te contactamos por WhatsApp en cuanto un técnico revise el caso."}
+        return SIN_ODOO
+    return {"ok": True, "ticket": r["ticket"],
+            "mensaje_cliente": "Tu caso quedó registrado; un técnico lo revisa y te escribe por WhatsApp."}
 
 
 class DerivarAsesorReq(BaseModel):
-    telefono: str
     motivo: str
     resumen: str
+    telefono: Optional[str] = None
 
 @app.post("/webhook/derivar-asesor")
-async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[str] = Header(None, alias="X-CeVi-Secret")):
+async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[str] = X_SECRET,
+                                 x_cevi_token: Optional[str] = X_TOKEN):
     if not _webhook_autorizado(x_cevi_secret):
         return JSONResponse({"error": "no autorizado"}, status_code=401)
     if not odoo_client.enabled():
-        return {"asesor": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
+        return SIN_ODOO
+    cli = _cliente(x_cevi_token)
     try:
         r = odoo_client.crear_ticket_voz(
-            req.telefono, req.resumen, urgencia="alta" if req.motivo == "seguridad" else "normal", motivo=req.motivo,
+            (cli or {}).get("telefono") or req.telefono, req.resumen,
+            urgencia="alta" if req.motivo == "seguridad" else "normal", motivo=req.motivo,
+            partner_id=(cli or {}).get("partner_id"), contexto=_contexto_maquina(cli) if cli else None,
+            titulo=f"Derivación ({req.motivo}): {req.resumen}",
         )
     except Exception:
         log.exception("derivar_asesor (voz) error")
-        return {"asesor": None, "mensaje_cliente": "Escríbenos por WhatsApp al 924 662 205, ahí te atendemos."}
-    return {"asesor": None, "mensaje_cliente": "Un asesor de C4V te escribe por WhatsApp en cuanto revise tu caso."}
+        return SIN_ODOO
+    return {"ok": True, "ticket": r["ticket"],
+            "mensaje_cliente": "Un asesor de C4V te escribe por WhatsApp en cuanto revise tu caso."}
+
+
+class AgendarVisitaReq(BaseModel):
+    tipo: str                       # videollamada | visita_presencial | llamada
+    motivo: str
+    fecha_preferida: Optional[str] = None
+    horario_preferido: Optional[str] = None
+    telefono: Optional[str] = None
+
+@app.post("/webhook/agendar-visita")
+async def webhook_agendar_visita(req: AgendarVisitaReq, x_cevi_secret: Optional[str] = X_SECRET,
+                                 x_cevi_token: Optional[str] = X_TOKEN):
+    """Deja una SOLICITUD de visita/videollamada con un técnico (no la confirma:
+    la fecha la coordina el equipo). Queda como ticket en Odoo."""
+    if not _webhook_autorizado(x_cevi_secret):
+        return JSONResponse({"error": "no autorizado"}, status_code=401)
+    if not odoo_client.enabled():
+        return SIN_ODOO
+    cli = _cliente(x_cevi_token)
+    tipo = {"videollamada": "videollamada", "visita_presencial": "visita presencial", "llamada": "llamada"}.get(req.tipo, req.tipo)
+    detalle = (f"Solicitud de {tipo} con un técnico. Motivo: {req.motivo}. "
+               f"Fecha preferida: {req.fecha_preferida or 'sin preferencia'}. Horario: {req.horario_preferido or 'sin preferencia'}.")
+    try:
+        r = odoo_client.crear_ticket_voz(
+            (cli or {}).get("telefono") or req.telefono, detalle,
+            partner_id=(cli or {}).get("partner_id"), contexto=_contexto_maquina(cli) if cli else None,
+            titulo=f"Agendar {tipo}: {req.motivo}", motivo="agenda",
+        )
+    except Exception:
+        log.exception("agendar_visita error")
+        return SIN_ODOO
+    return {"ok": True, "solicitud": r["ticket"],
+            "mensaje_cliente": f"Dejé tu solicitud de {tipo}. Un técnico te escribe por WhatsApp para confirmar día y hora."}
 
 
 # ───────────────────────────────────────────────────────────────

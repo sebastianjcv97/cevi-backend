@@ -251,25 +251,36 @@ def buscar_por_telefono(telefono):
     }
 
 
-def crear_ticket_voz(telefono, descripcion, ya_intento=None, serie=None, urgencia="normal", motivo=None):
+def _contacto_sin_verificar(telefono):
+    """Contacto mínimo para un caso que llegó SIN identidad verificada (sin el
+    token del portal). No se engancha a un cliente real que coincida por
+    teléfono: cualquiera puede decir un número ajeno. Lleva la categoría demo
+    para no mezclarse con la cartera real; el equipo lo une si corresponde."""
+    tel = (telefono or "").strip() or "sin teléfono"
+    nombre = f"Cliente CeVi voz ({tel}) — sin verificar"
+    ids = _ex("res.partner", "search", [["name", "=", nombre]], limit=1)
+    if ids:
+        return ids[0]
+    return _ex(
+        "res.partner", "create",
+        {
+            "name": nombre,
+            "phone": telefono or False,
+            "category_id": [(4, _state["cat_id"])],
+            "comment": "Creado por CeVi (agente de voz) para un caso que llegó sin identidad verificada por el portal.",
+        },
+    )
+
+
+def crear_ticket_voz(telefono, descripcion, ya_intento=None, serie=None, urgencia="normal",
+                     motivo=None, partner_id=None, contexto=None, titulo=None):
     """Crea un ticket de Helpdesk REAL (equipo 'CeVi', etiqueta 'CeVi Voz') para
-    las tools crear_ticket / derivar_asesor del agente de voz. Si el teléfono no
-    matchea a nadie, crea un contacto mínimo con ese número (no se pierde el caso).
-    Devuelve {'ticket','partner_id'}."""
+    las tools del agente de voz. Si viene partner_id (identidad verificada por el
+    portal), el ticket va a la ficha de ese cliente; si no, a un contacto
+    "sin verificar". `contexto` (modelo, serie, certificado) se agrega para que
+    el técnico no tenga que volver a preguntar. Devuelve {'ticket','partner_id'}."""
     _connect()
-    info = buscar_por_telefono(telefono)
-    if info:
-        pid = info["partner_id"]
-    else:
-        pid = _ex(
-            "res.partner", "create",
-            {
-                "name": f"Cliente CeVi voz ({telefono})",
-                "phone": telefono,
-                "category_id": [(4, _state["cat_id"])],  # comparte la categoría demo: no es cliente verificado
-                "comment": "Creado automáticamente por CeVi (agente de voz) — no se encontró por teléfono en Odoo.",
-            },
-        )
+    pid = int(partner_id) if partner_id else _contacto_sin_verificar(telefono)
     detalle = descripcion or ""
     if motivo:
         detalle = f"[{motivo}] " + detalle
@@ -277,14 +288,19 @@ def crear_ticket_voz(telefono, descripcion, ya_intento=None, serie=None, urgenci
         detalle += f"\n\nYa intentó: {ya_intento}"
     if serie:
         detalle += f"\n\nNº de serie mencionado: {serie}"
+    if contexto:
+        detalle += f"\n\nDatos del portal: {contexto}"
+    if not partner_id:
+        detalle += "\n\n⚠️ Identidad NO verificada por el portal: confirmar quién es antes de dar datos."
     vals = {
-        "name": (descripcion or "Caso desde CeVi voz")[:120],
+        "name": (titulo or descripcion or "Caso desde CeVi voz")[:120],
         "partner_id": pid,
-        "description": f"<p>{_esc(detalle)}</p><p><i>Generado por CeVi (agente de voz ElevenLabs).</i></p>",
+        "description": "".join(f"<p>{_esc(parrafo)}</p>" for parrafo in detalle.split("\n\n"))
+                       + "<p><i>Generado por CeVi (agente de voz ElevenLabs).</i></p>",
         "team_id": _state["team_id"],
         "tag_ids": [(4, _state["voz_tag_id"])],
     }
-    if urgencia == "alta" and "priority" not in vals:
+    if urgencia == "alta":
         vals["priority"] = "2"
     tid = _ex("helpdesk.ticket", "create", vals)
     ref = None
@@ -295,3 +311,36 @@ def crear_ticket_voz(telefono, descripcion, ya_intento=None, serie=None, urgenci
     except Exception:
         pass
     return {"ticket": ref or str(tid), "partner_id": pid}
+
+
+# Etapas de Helpdesk dichas como las entiende el cliente.
+_ETAPA_CLIENTE = {
+    "New": "recibido, en cola para un técnico",
+    "In Progress": "un técnico lo está revisando",
+    "On Hold": "en espera (falta algo de tu lado o un repuesto)",
+    "Solved": "resuelto",
+    "Canceled": "cerrado sin acción",
+}
+
+
+def tickets_de_partner(partner_id, limite=5):
+    """Últimos casos del cliente, con su estado en palabras simples."""
+    _connect()
+    recs = _ex(
+        "helpdesk.ticket", "search_read", [["partner_id", "=", int(partner_id)]],
+        fields=["ticket_ref", "name", "stage_id", "create_date", "write_date", "priority"],
+        order="create_date desc", limit=limite,
+    )
+    out = []
+    for r in recs:
+        etapa = r["stage_id"][1] if r.get("stage_id") else ""
+        out.append({
+            "numero": r.get("ticket_ref") or str(r["id"]),
+            "asunto": r.get("name") or "",
+            "estado": _ETAPA_CLIENTE.get(etapa, etapa or "sin estado"),
+            "abierto": etapa not in ("Solved", "Canceled"),
+            "creado": (r.get("create_date") or "")[:10],
+            "ultima_actualizacion": (r.get("write_date") or "")[:10],
+            "urgente": r.get("priority") in ("2", "3"),
+        })
+    return out
