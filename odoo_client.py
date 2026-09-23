@@ -41,10 +41,31 @@ _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
 _ctx.verify_mode = ssl.CERT_NONE
 
+# ── Casos de CeVi voz con la estructura del equipo (decisión 23-set-2026) ──
+# Van al tablero que el equipo ya trabaja, "Atención al cliente" de C4V LASER
+# (helpdesk.team 12), SIN asignar (lo reparte la coordinación), con UNA
+# etiqueta de tipo como las del equipo + "CeVi Voz" para saber el origen, el
+# título en mayúsculas ("SOPORTE TECNICO - 13100U - ...") y la ficha del
+# cliente en la descripción. Las PRUEBAS (contacto verificado con la categoría
+# "CeVi Demo", como Martín) siguen en el tablero "CeVi" (14).
+# Lo comercial no es un caso: es una oportunidad en el CRM (Ventas Perú,
+# Bolivia o Ecuador), donde trabajan los asesores.
+EQUIPO_REAL = int(os.environ.get("CEVI_EQUIPO_REAL") or 12)
+SIMULAR = os.environ.get("CEVI_ODOO_SIMULAR") == "1"   # solo registra en el log lo que crearía
+ETIQUETA_TIPO = {
+    "soporte": "SOPORTE TECNICO", "seguridad": "SEGURIDAD", "cotizacion": "COTIZACION",
+    "revision": "SOPORTE TECNICO", "instalacion_y_capacitacion": "INSTALACION Y CAPACITACION",
+    "capacitacion": "CAPACITACION VIRTUAL", "mantenimiento": "MANTENIMIENTO PREVENTIVO",
+    "repuesto": "INSTALACION REPUESTO",
+}
+ETIQUETAS_NUEVAS = {"SOPORTE TECNICO", "SEGURIDAD"}   # creación aprobada por Sebastián (23-set-2026)
+CRM_EQUIPO = {"PE": 5, "BO": 7, "EC": 6}               # Ventas Peru / Ventas Bolivia / Ventas Ecuador
+CRM_EMPRESA = {"BO": 3, "EC": 4}                       # Perú: la empresa que le vendió (1 o 13); si no, 1
+
 _lock = threading.Lock()
 _state = {
     "uid": None, "models": None, "team_id": None, "hd_tag_id": None, "cat_id": None,
-    "voz_tag_id": None,
+    "voz_tag_id": None, "tipo_tags": {}, "equipos": {},
 }
 
 
@@ -86,6 +107,32 @@ def _ensure_setup():
     _state["hd_tag_id"] = _find_or_create("helpdesk.tag", [["name", "=", DEMO_TAG]], {"name": DEMO_TAG})
     _state["cat_id"] = _find_or_create("res.partner.category", [["name", "=", DEMO_TAG]], {"name": DEMO_TAG})
     _state["voz_tag_id"] = _find_or_create("helpdesk.tag", [["name", "=", VOZ_TAG]], {"name": VOZ_TAG})
+    try:
+        _setup_estructura()
+    except Exception:
+        log.exception("Odoo: no se pudo leer la estructura del tablero; los casos salen sin etiqueta de tipo")
+
+
+def _setup_estructura():
+    """Etiquetas de tipo (solo busca las del equipo; crea las dos aprobadas) y,
+    por tablero, su empresa y las propiedades FECHA DE ENTREGA y CIUDAD."""
+    tags = {}
+    for nombre in set(ETIQUETA_TIPO.values()):
+        ids = _ex("helpdesk.tag", "search", [["name", "=", nombre]], limit=1)
+        if not ids and nombre in ETIQUETAS_NUEVAS:
+            ids = [_ex("helpdesk.tag", "create", {"name": nombre})]
+        if ids:
+            tags[nombre] = ids[0]
+    _state["tipo_tags"] = tags
+    for equipo in {EQUIPO_REAL, _state["team_id"]}:
+        rec = _ex("helpdesk.team", "read", [equipo], fields=["company_id", "ticket_properties"])
+        if not rec:
+            continue
+        props = {str(d.get("string", "")).upper(): d.get("name") for d in rec[0].get("ticket_properties") or []}
+        _state["equipos"][equipo] = {
+            "empresa": (rec[0].get("company_id") or [None])[0],
+            "entrega": props.get("FECHA DE ENTREGA"), "ciudad": props.get("CIUDAD"),
+        }
 
 
 def _esc(s):
@@ -272,45 +319,144 @@ def _contacto_sin_verificar(telefono):
     )
 
 
-def crear_ticket_voz(telefono, descripcion, ya_intento=None, serie=None, urgencia="normal",
-                     motivo=None, partner_id=None, contexto=None, titulo=None):
-    """Crea un ticket de Helpdesk REAL (equipo 'CeVi', etiqueta 'CeVi Voz') para
-    las tools del agente de voz. Si viene partner_id (identidad verificada por el
-    portal), el ticket va a la ficha de ese cliente; si no, a un contacto
-    "sin verificar". `contexto` (modelo, serie, certificado) se agrega para que
-    el técnico no tenga que volver a preguntar. Devuelve {'ticket','partner_id'}."""
-    _connect()
-    pid = int(partner_id) if partner_id else _contacto_sin_verificar(telefono)
-    detalle = descripcion or ""
-    if motivo:
-        detalle = f"[{motivo}] " + detalle
-    if ya_intento:
-        detalle += f"\n\nYa intentó: {ya_intento}"
-    if serie:
-        detalle += f"\n\nNº de serie mencionado: {serie}"
-    if contexto:
-        detalle += f"\n\nDatos del portal: {contexto}"
+def es_prueba(partner_id) -> bool:
+    """Contacto VERIFICADO con la categoría "CeVi Demo" (p. ej. Martín): sus
+    casos van al tablero de pruebas, nunca al del equipo ni al CRM."""
     if not partner_id:
-        detalle += "\n\n⚠️ Identidad NO verificada por el portal: confirmar quién es antes de dar datos."
-    vals = {
-        "name": (titulo or descripcion or "Caso desde CeVi voz")[:120],
-        "partner_id": pid,
-        "description": "".join(f"<p>{_esc(parrafo)}</p>" for parrafo in detalle.split("\n\n"))
-                       + "<p><i>Generado por CeVi (agente de voz ElevenLabs).</i></p>",
-        "team_id": _state["team_id"],
-        "tag_ids": [(4, _state["voz_tag_id"])],
-    }
-    if urgencia == "alta":
-        vals["priority"] = "2"
-    tid = _ex("helpdesk.ticket", "create", vals)
+        return False
+    _connect()
+    rec = _ex("res.partner", "read", [int(partner_id)], fields=["category_id"])
+    return bool(rec) and _state["cat_id"] in (rec[0].get("category_id") or [])
+
+
+def _vinculos(maquina, empresa):
+    """Producto, serie (lote) y pedido de la máquina del cliente, solo los que
+    Odoo acepta en un caso de ese tablero: el pedido tiene que ser de la misma
+    empresa y el lote, del mismo producto."""
+    v = {}
+    if not maquina:
+        return v
+    try:
+        cod = re.match(r"\s*\[([^\]]+)\]", str(maquina.get("producto") or ""))
+        if cod:
+            ids = _ex("product.product", "search", [["default_code", "=", cod.group(1)]], limit=1)
+            if ids:
+                v["product_id"] = ids[0]
+        if maquina.get("serie") and v.get("product_id"):
+            dom = [["name", "=", maquina["serie"]], ["product_id", "=", v["product_id"]]]
+            if empresa:
+                dom += ["|", ["company_id", "=", False], ["company_id", "=", empresa]]
+            ids = _ex("stock.lot", "search", dom, limit=1)
+            if ids:
+                v["lot_id"] = ids[0]
+        if maquina.get("pedido") and empresa:
+            ids = _ex("sale.order", "search", [["name", "=", maquina["pedido"]], ["company_id", "=", empresa]], limit=1)
+            if ids:
+                v["sale_order_id"] = ids[0]
+    except Exception:
+        log.exception("Odoo: no se pudieron buscar producto/serie/pedido")
+    return v
+
+
+def caso_reciente(conversation_id, titulo):
+    """Si en esta conversación ya se creó este mismo caso en los últimos 30 min
+    (aunque el backend se haya reiniciado), devuelve su número."""
+    if not conversation_id:
+        return None
+    _connect()
+    desde = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 1800))
+    rec = _ex("helpdesk.ticket", "search_read",
+              [["description", "ilike", conversation_id], ["name", "=", titulo], ["create_date", ">=", desde]],
+              fields=["ticket_ref"], limit=1)
+    return (rec[0].get("ticket_ref") or str(rec[0]["id"])) if rec else None
+
+
+def crear_caso_voz(tipo, titulo, cuerpo_html, prioridad="0", partner_id=None, telefono=None,
+                   ciudad=None, maquina=None):
+    """Caso de Helpdesk como los crea el equipo (ver arriba). Devuelve
+    {'ticket', 'partner_id', 'equipo'}. Si Odoo rechaza los vínculos o las
+    propiedades (p. ej. empresas cruzadas), se crea igual sin ellos."""
+    _connect()
+    prueba = es_prueba(partner_id)
+    pid = int(partner_id) if partner_id else _contacto_sin_verificar(telefono)
+    equipo = _state["team_id"] if prueba else EQUIPO_REAL
+    info = _state["equipos"].get(equipo, {})
+    etiquetas = [_state["voz_tag_id"]]
+    tipo_tag = _state["tipo_tags"].get(ETIQUETA_TIPO.get(tipo, "SOPORTE TECNICO"))
+    if tipo_tag:
+        etiquetas.insert(0, tipo_tag)
+    if prueba:
+        etiquetas.append(_state["hd_tag_id"])
+    vals = {"name": titulo, "partner_id": pid, "team_id": equipo, "description": cuerpo_html,
+            "tag_ids": [(6, 0, etiquetas)], "priority": prioridad, "user_id": False}
+    extra = _vinculos(maquina, info.get("empresa"))
+    props = {}
+    if info.get("entrega") and (maquina or {}).get("fecha_entrega"):
+        props[info["entrega"]] = str(maquina["fecha_entrega"])[:10]
+    if info.get("ciudad") and ciudad:
+        props[info["ciudad"]] = str(ciudad).upper()
+    if props:
+        extra["properties"] = props
+    if SIMULAR:
+        log.info("SIMULAR helpdesk.ticket.create %s", {**vals, **extra})
+        return {"ticket": "SIMULADO", "partner_id": pid, "equipo": equipo}
+    try:
+        tid = _ex("helpdesk.ticket", "create", {**vals, **extra})
+    except Exception:
+        log.exception("Odoo rechazó el caso con vínculos/propiedades %s; se crea sin ellos", list(extra))
+        tid = _ex("helpdesk.ticket", "create", vals)
     ref = None
     try:
         rec = _ex("helpdesk.ticket", "read", [tid], fields=["ticket_ref"])
-        if rec:
-            ref = rec[0].get("ticket_ref")
+        ref = rec[0].get("ticket_ref") if rec else None
     except Exception:
         pass
-    return {"ticket": ref or str(tid), "partner_id": pid}
+    return {"ticket": ref or str(tid), "partner_id": pid, "equipo": equipo}
+
+
+def _origen_crm(nombre):
+    """Fuente (utm.source) con ese nombre; se crea la primera vez. Sirve para
+    contar en el CRM cuántas oportunidades trae cada CeVi."""
+    if not nombre:
+        return None
+    if nombre not in _state.setdefault("origenes", {}):
+        _state["origenes"][nombre] = _find_or_create("utm.source", [["name", "=", nombre]], {"name": nombre})
+    return _state["origenes"][nombre]
+
+
+def _empresa_de_maquina(maquina):
+    """Empresa que le vendió la máquina: la de la ficha o, si no está, la del pedido."""
+    emp = (maquina or {}).get("empresa_id")
+    if emp:
+        return emp
+    if (maquina or {}).get("pedido"):
+        rec = _ex("sale.order", "search_read", [["name", "=", maquina["pedido"]]], fields=["company_id"], limit=1)
+        if rec and rec[0].get("company_id"):
+            return rec[0]["company_id"][0]
+    return None
+
+
+def crear_oportunidad_voz(nombre, cuerpo_html, partner_id=None, telefono=None, pais="PE", maquina=None,
+                          origen="CeVi soporte"):
+    """Consulta comercial → oportunidad en el CRM (etapa New, sin asignar), en
+    el equipo de ventas del país, como las que cargan los asesores. `origen` va
+    como fuente (utm.source) para distinguir de dónde vino ("CeVi soporte",
+    "CeVi web ventas"). Devuelve {'ticket', 'partner_id'}."""
+    _connect()
+    pid = int(partner_id) if partner_id else _contacto_sin_verificar(telefono)
+    pais = (pais or "PE").upper()[:2]
+    emp_maq = _empresa_de_maquina(maquina)
+    empresa = CRM_EMPRESA.get(pais) or (emp_maq if emp_maq in (1, 13) else 1)
+    vals = {"name": nombre, "type": "opportunity", "partner_id": pid, "team_id": CRM_EQUIPO.get(pais, 5),
+            "company_id": empresa, "user_id": False, "description": cuerpo_html}
+    fuente = _origen_crm(origen) if not SIMULAR else None
+    if fuente:
+        vals["source_id"] = fuente
+    if SIMULAR:
+        log.info("SIMULAR crm.lead.create %s", vals)
+        return {"ticket": "SIMULADO", "partner_id": pid}
+    lid = _ex("crm.lead", "create", vals)
+    return {"ticket": f"oportunidad {lid}", "partner_id": pid}
 
 
 # Etapas de Helpdesk dichas como las entiende el cliente.

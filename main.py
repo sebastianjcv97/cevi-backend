@@ -391,15 +391,94 @@ def _cliente(token: Optional[str]):
     return identidad.cliente_de_token(token)
 
 
-def _contexto_maquina(cli) -> str:
-    partes = []
-    for m in identidad.resumen_maquinas(cli.get("maquinas")):
-        partes.append(
-            f"{m['modelo'] or 'modelo sin registrar'} serie {m['serie'] or 'sin registrar'}, "
-            f"certificado {m['certificado']['estado']} {m['certificado']['fecha']}, entrega {m['fecha_entrega']}"
-        )
-    base = f"{cli.get('nombre','')} ({cli.get('pais','')}, tel {cli.get('telefono','')})"
-    return base + (" — " + "; ".join(partes) if partes else "")
+# ── Casos en Odoo con la estructura del equipo (23-set-2026) ─────────────
+# Título en mayúsculas y sin tildes, como los escribe el equipo ("13100 PROIA",
+# "INSTALACION Y CAPACITACION - 9060 PROIA"), y la descripción como la ficha
+# del caso #12: una línea "ETIQUETA: valor" por dato.
+import unicodedata
+
+
+def _mayus(s) -> str:
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode()
+    return " ".join(s.upper().split())
+
+
+def _titulo(*partes, verificado=True, maximo=80) -> str:
+    t = " - ".join(p for p in (_mayus(x) for x in partes) if p)
+    if not verificado:
+        t = "SIN VERIFICAR - " + t
+    if len(t) > maximo:
+        t = t[:maximo].rsplit(" ", 1)[0]
+    return t.rstrip(" -,.;:") or "CASO CEVI"
+
+
+def _maquina_elegida(cli, modelo=None):
+    """La máquina de la que habla: la única que tiene o, si tiene varias, la
+    del modelo que dijo. Si no se sabe, None."""
+    maqs = (cli or {}).get("maquinas") or []
+    if len(maqs) == 1:
+        return maqs[0]
+    clave = _mayus(modelo).replace(" ", "")
+    if clave:
+        for m in maqs:
+            if clave in _mayus(m.get("modelo")).replace(" ", ""):
+                return m
+    return None
+
+
+def _ficha(*bloques) -> str:
+    """Bloques de (etiqueta, valor) → HTML: una línea por dato, <hr/> entre bloques."""
+    esc = lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html = []
+    for bloque in bloques:
+        filas = [f"<p><b>{esc(k)}:</b> {esc(v)}</p>" for k, v in bloque if v not in (None, "")]
+        if filas:
+            html.append("".join(filas))
+    return "<hr/>".join(html)
+
+
+def _bloque_cliente(cli, maquina, telefono):
+    if not cli:
+        return [("TELEFONO", telefono or "no lo dio")]
+    filas = [("NOMBRE DEL CLIENTE", cli.get("nombre")), ("TELEFONO", telefono or cli.get("telefono")),
+             ("CIUDAD", _mayus(cli.get("ciudad")) or "sin registrar")]
+    if maquina:
+        r = identidad.resumen_maquinas([maquina])[0]
+        g = r.get("garantia") or {}
+        if g.get("hasta_referencial"):
+            gar = f"{'vigente hasta' if g.get('vigente') else 'vencida desde'} {g['hasta_referencial']} (referencial)"
+        else:
+            gar = "sin fecha de entrega registrada"
+        cert = r["certificado"]
+        filas += [("MODELO", r["modelo"] or "sin registrar"), ("SERIE", r["serie"] or "sin registrar"),
+                  ("PEDIDO", maquina.get("pedido")), ("DIA DE ENTREGA", r["fecha_entrega"]),
+                  ("GARANTIA", gar), ("INSTALACION", r.get("instalacion"))]
+        if cert.get("estado") and cert["estado"] not in ("desconocido", "sin certificado registrado"):
+            filas.append(("CERTIFICADO", f"{cert['estado']} {cert.get('fecha') or ''}".strip()))
+    else:
+        maqs = cli.get("maquinas") or []
+        if maqs:
+            filas.append(("MAQUINAS DEL CLIENTE", "; ".join(
+                f"{m.get('modelo') or '?'} {m.get('serie') or ''}".strip() for m in maqs) + " (no dijo cuál)"))
+    return filas
+
+
+def _bloque_origen(conversation_id, verificado):
+    filas = [("ORIGEN", "CeVi voz (asistente del portal)"), ("CONVERSACION", conversation_id)]
+    if not verificado:
+        filas.append(("ATENCION", "identidad no verificada por el portal; confirmar quién es antes de dar datos"))
+    return filas
+
+
+def _caso(tipo, titulo, bloque_caso, cli, maquina, telefono, conversation_id, prioridad="0"):
+    """Crea el caso en Odoo (o devuelve el que ya se creó en esta conversación)."""
+    previo = odoo_client.caso_reciente(conversation_id, titulo)
+    if previo:
+        return {"ticket": previo}
+    cuerpo = _ficha(bloque_caso, _bloque_cliente(cli, maquina, telefono), _bloque_origen(conversation_id, bool(cli)))
+    return odoo_client.crear_caso_voz(
+        tipo, titulo, cuerpo, prioridad=prioridad, partner_id=(cli or {}).get("partner_id"),
+        telefono=telefono, ciudad=(cli or {}).get("ciudad"), maquina=maquina)
 
 
 SIN_ODOO = {"ok": False, "mensaje_cliente": "Se me trabó el sistema. Escríbenos por WhatsApp al 924 662 205 y te atienden directo."}
@@ -598,10 +677,6 @@ def _ya_creado(conversation_id, tool, texto):
     return clave, (previo[1] if previo else None)
 
 
-def _conv_txt(conversation_id):
-    return f" · Conversación ElevenLabs: {conversation_id}" if conversation_id else ""
-
-
 class CrearTicketReq(BaseModel):
     descripcion: str
     telefono: Optional[str] = None
@@ -609,10 +684,13 @@ class CrearTicketReq(BaseModel):
     ya_intento: Optional[str] = None
     serie: Optional[str] = None
     urgencia: Optional[str] = "normal"
+    modelo: Optional[str] = None
 
 @app.post("/webhook/crear-ticket")
 async def webhook_crear_ticket(req: CrearTicketReq, x_cevi_secret: Optional[str] = X_SECRET,
                                x_cevi_token: Optional[str] = X_TOKEN):
+    """Caso de soporte técnico: tablero del equipo, etiqueta SOPORTE TECNICO,
+    prioridad alta (2) si la máquina está parada."""
     if not _webhook_autorizado(x_cevi_secret):
         return JSONResponse({"error": "no autorizado"}, status_code=401)
     if not odoo_client.enabled():
@@ -621,13 +699,15 @@ async def webhook_crear_ticket(req: CrearTicketReq, x_cevi_secret: Optional[str]
     clave, previo = _ya_creado(req.conversation_id, "crear", req.descripcion)
     if previo:
         return {"ok": True, "ticket": previo, "mensaje_cliente": "Ese caso ya quedó registrado; un técnico lo revisa y te escribe por WhatsApp."}
+    maquina = _maquina_elegida(cli, req.modelo)
+    parada = (req.urgencia or "normal") == "alta"
+    titulo = _titulo("SOPORTE TECNICO", (maquina or {}).get("modelo") or req.modelo, req.descripcion, verificado=bool(cli))
+    bloque = [("QUE PASA", req.descripcion), ("YA INTENTO", req.ya_intento or "nada todavía"),
+              ("MAQUINA PARADA", "SI" if parada else "NO"), ("SERIE QUE DICTO", req.serie)]
     try:
-        r = odoo_client.crear_ticket_voz(
-            (cli or {}).get("telefono") or req.telefono, req.descripcion, ya_intento=req.ya_intento,
-            serie=req.serie, urgencia=req.urgencia or "normal",
-            partner_id=(cli or {}).get("partner_id"),
-            contexto=((_contexto_maquina(cli) if cli else "") + _conv_txt(req.conversation_id)) or None,
-        )
+        r = await run_in_threadpool(_caso, "soporte", titulo, bloque, cli, maquina,
+                                    (cli or {}).get("telefono") or req.telefono, req.conversation_id,
+                                    "2" if parada else "0")
     except Exception:
         log.exception("crear_ticket (voz) error")
         return SIN_ODOO
@@ -642,10 +722,18 @@ class DerivarAsesorReq(BaseModel):
     resumen: str
     telefono: Optional[str] = None
     conversation_id: Optional[str] = None
+    modelo: Optional[str] = None
+    interes: Optional[str] = None   # comercial: qué quiere, en pocas palabras ("tubo nuevo", "una 16100")
+
+_MOTIVO = {"seguridad": "Seguridad", "soporte": "Soporte técnico", "lo_pidio": "Pidió hablar con una persona",
+           "comercial": "Comercial"}
 
 @app.post("/webhook/derivar-asesor")
 async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[str] = X_SECRET,
                                  x_cevi_token: Optional[str] = X_TOKEN):
+    """Pasa el caso a una persona. Comercial → oportunidad en el CRM (Ventas
+    del país). Seguridad → caso con etiqueta SEGURIDAD y prioridad urgente (3).
+    Soporte o lo pidió → caso SOPORTE TECNICO."""
     if not _webhook_autorizado(x_cevi_secret):
         return JSONResponse({"error": "no autorizado"}, status_code=401)
     if not odoo_client.enabled():
@@ -654,14 +742,30 @@ async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[
     clave, previo = _ya_creado(req.conversation_id, "derivar", req.resumen)
     if previo:
         return {"ok": True, "ticket": previo, "mensaje_cliente": "Ya le avisé al equipo; un asesor de C4V te escribe por WhatsApp."}
+    maquina = _maquina_elegida(cli, req.modelo)
+    modelo = (maquina or {}).get("modelo") or req.modelo
+    tel = (cli or {}).get("telefono") or req.telefono
+    bloque = [("MOTIVO", _MOTIVO.get(req.motivo, req.motivo)), ("LE INTERESA", req.interes), ("RESUMEN", req.resumen)]
+
+    def _derivar():
+        pid = (cli or {}).get("partner_id")
+        if req.motivo == "comercial" and not odoo_client.es_prueba(pid):
+            interes = " ".join((req.interes or "").split())[:60]
+            nombre = (interes[:1].upper() + interes[1:]) if interes else "Consulta comercial"
+            cuerpo = _ficha(bloque, _bloque_cliente(cli, maquina, tel), _bloque_origen(req.conversation_id, bool(cli)))
+            return odoo_client.crear_oportunidad_voz(nombre, cuerpo, partner_id=pid, telefono=tel,
+                                                     pais=(cli or {}).get("pais") or "PE", maquina=maquina)
+        if req.motivo == "seguridad":
+            return _caso("seguridad", _titulo("SEGURIDAD", modelo, req.resumen, verificado=bool(cli)),
+                         bloque, cli, maquina, tel, req.conversation_id, "3")
+        if req.motivo == "comercial":   # cliente de pruebas: al tablero de pruebas, nunca al CRM
+            return _caso("cotizacion", _titulo("COTIZACION", modelo, req.resumen, verificado=bool(cli)),
+                         bloque, cli, maquina, tel, req.conversation_id)
+        partes = ("LLAMAR AL CLIENTE", modelo) if req.motivo == "lo_pidio" else ("SOPORTE TECNICO", modelo, "PIDE ASESOR")
+        return _caso("soporte", _titulo(*partes, verificado=bool(cli)), bloque, cli, maquina, tel, req.conversation_id)
+
     try:
-        r = odoo_client.crear_ticket_voz(
-            (cli or {}).get("telefono") or req.telefono, req.resumen,
-            urgencia="alta" if req.motivo == "seguridad" else "normal", motivo=req.motivo,
-            partner_id=(cli or {}).get("partner_id"),
-            contexto=((_contexto_maquina(cli) if cli else "") + _conv_txt(req.conversation_id)) or None,
-            titulo=f"Derivación ({req.motivo}): {req.resumen}",
-        )
+        r = await run_in_threadpool(_derivar)
     except Exception:
         log.exception("derivar_asesor (voz) error")
         return SIN_ODOO
@@ -674,34 +778,49 @@ async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[
 class AgendarVisitaReq(BaseModel):
     tipo: str                       # videollamada | visita_presencial | llamada
     motivo: str
+    servicio: Optional[str] = "revision"   # revision | capacitacion | instalacion_y_capacitacion | mantenimiento | repuesto
     fecha_preferida: Optional[str] = None
     horario_preferido: Optional[str] = None
     telefono: Optional[str] = None
     conversation_id: Optional[str] = None
+    modelo: Optional[str] = None
+
+_SERVICIO = {  # título como los del equipo, y cómo se lee en la ficha
+    "revision": ("REVISION TECNICA", "Revisión técnica"),
+    "capacitacion": ("CAPACITACION VIRTUAL", "Capacitación"),
+    "instalacion_y_capacitacion": ("INSTALACION Y CAPACITACION", "Instalación y capacitación"),
+    "mantenimiento": ("MANTENIMIENTO PREVENTIVO", "Mantenimiento preventivo"),
+    "repuesto": ("INSTALACION REPUESTO", "Instalación de repuesto"),
+}
 
 @app.post("/webhook/agendar-visita")
 async def webhook_agendar_visita(req: AgendarVisitaReq, x_cevi_secret: Optional[str] = X_SECRET,
                                  x_cevi_token: Optional[str] = X_TOKEN):
     """Deja una SOLICITUD de visita/videollamada con un técnico (no la confirma:
-    la fecha la coordina el equipo). Queda como ticket en Odoo."""
+    la fecha la coordina el equipo). Caso con la etiqueta del servicio, como
+    las agendas que ya carga el equipo; FECHA DE INSTALACION queda vacía."""
     if not _webhook_autorizado(x_cevi_secret):
         return JSONResponse({"error": "no autorizado"}, status_code=401)
     if not odoo_client.enabled():
         return SIN_ODOO
     cli = _cliente(x_cevi_token)
     tipo = {"videollamada": "videollamada", "visita_presencial": "visita presencial", "llamada": "llamada"}.get(req.tipo, req.tipo)
-    detalle = (f"Solicitud de {tipo} con un técnico. Motivo: {req.motivo}. "
-               f"Fecha preferida: {req.fecha_preferida or 'sin preferencia'}. Horario: {req.horario_preferido or 'sin preferencia'}.")
     clave, previo = _ya_creado(req.conversation_id, "agendar", req.motivo)
     if previo:
         return {"ok": True, "solicitud": previo, "mensaje_cliente": f"Tu solicitud de {tipo} ya quedó registrada; un técnico te escribe para confirmar."}
+    servicio = req.servicio if req.servicio in _SERVICIO else "revision"
+    titulo_srv, leido = _SERVICIO[servicio]
+    if servicio == "capacitacion" and req.tipo == "visita_presencial":
+        titulo_srv = "CAPACITACION"
+    maquina = _maquina_elegida(cli, req.modelo)
+    titulo = _titulo(titulo_srv, (maquina or {}).get("modelo") or req.modelo, verificado=bool(cli))
+    bloque = [("SERVICIO SOLICITADO", f"{leido} por {tipo}"), ("MOTIVO", req.motivo),
+              ("FECHA PREFERIDA", req.fecha_preferida or "sin preferencia"),
+              ("HORARIO PREFERIDO", req.horario_preferido or "sin preferencia"),
+              ("FECHA POR CONFIRMAR", "la coordina el equipo con el cliente por WhatsApp")]
     try:
-        r = odoo_client.crear_ticket_voz(
-            (cli or {}).get("telefono") or req.telefono, detalle,
-            partner_id=(cli or {}).get("partner_id"),
-            contexto=((_contexto_maquina(cli) if cli else "") + _conv_txt(req.conversation_id)) or None,
-            titulo=f"Agendar {tipo}: {req.motivo}", motivo="agenda",
-        )
+        r = await run_in_threadpool(_caso, servicio, titulo, bloque, cli, maquina,
+                                    (cli or {}).get("telefono") or req.telefono, req.conversation_id)
     except Exception:
         log.exception("agendar_visita error")
         return SIN_ODOO
