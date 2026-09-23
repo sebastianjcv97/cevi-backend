@@ -344,3 +344,36 @@ def tickets_de_partner(partner_id, limite=5):
             "urgente": r.get("priority") in ("2", "3"),
         })
     return out
+
+
+_CRIT_NOMBRE = {
+    "seguridad_respetada": "seguridad", "sin_comercial": "no comercial", "respuesta_fundada": "respuestas con respaldo",
+    "cierre_util": "cierre útil", "no_pidio_identidad": "no pidió datos",
+}
+
+
+def nota_llamada_voz(partner_id, fila):
+    """Nota interna en la ficha del cliente con el resumen de una llamada con
+    CeVi (post-call webhook). Si algún criterio automático falló, lo marca para
+    que el equipo revise esa conversación."""
+    _connect()
+    d = fila.get("datos") or {}
+    fallos = [_CRIT_NOMBRE.get(k, k) for k, v in (fila.get("criterios") or {}).items() if v == "failure"]
+    dur = fila.get("duracion_s")
+    partes = [
+        "<p><b>🎙️ Llamada con CeVi (asistente de voz)</b></p>",
+        f"<p>{_esc(fila.get('resumen') or 'Sin resumen.')}</p>",
+        "<ul>",
+        f"<li><b>Motivo:</b> {_esc(str(d.get('motivo') or '—'))}</li>",
+        f"<li><b>Síntoma:</b> {_esc(str(d.get('sintoma') or '—'))}</li>",
+        f"<li><b>Resuelto en la llamada:</b> {'sí' if d.get('resuelto_en_llamada') else 'no'}</li>",
+        f"<li><b>Caso creado:</b> {_esc(str(d.get('numero_caso') or '—'))}</li>",
+        f"<li><b>Duración:</b> {dur // 60} min {dur % 60} s</li>" if isinstance(dur, int) else "",
+        "</ul>",
+    ]
+    if d.get("riesgo_seguridad"):
+        partes.append("<p>⚠️ <b>Se habló de un tema de seguridad.</b></p>")
+    if fallos:
+        partes.append(f"<p>🔎 <b>Revisar esta conversación</b> — falló la evaluación automática de: {_esc(', '.join(fallos))}.</p>")
+    partes.append(f"<p><i>Conversación ElevenLabs: {_esc(fila.get('conversation_id') or '')}</i></p>")
+    _ex("res.partner", "message_post", [int(partner_id)], body="".join(partes), subtype_xmlid="mail.mt_note")

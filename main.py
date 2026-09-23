@@ -13,7 +13,7 @@ Variables de entorno (Railway):
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -366,15 +366,21 @@ async def identify(req: IdentifyRequest):
 # quedan "sin verificar" y no se muestran tickets ni garantía de nadie.
 # Avisos al equipo: solo el ticket en el Helpdesk de Odoo (decisión 23-set-2026).
 
+import hashlib
+import hmac
+import time
 import identidad
+import conversaciones
 
 
 def _webhook_autorizado(secret_header: Optional[str]) -> bool:
+    """Falla CERRADO: si un redeploy pierde la variable, los webhooks se niegan
+    (antes quedaban abiertos a cualquiera). Comparación en tiempo constante."""
     esperado = os.environ.get("CEVI_WEBHOOK_SECRET")
     if not esperado:
-        log.warning("CEVI_WEBHOOK_SECRET no configurada — webhooks de voz sin protección")
-        return True
-    return secret_header == esperado
+        log.error("CEVI_WEBHOOK_SECRET no configurada — webhooks de voz CERRADOS")
+        return False
+    return bool(secret_header) and hmac.compare_digest(secret_header, esperado)
 
 
 def _cliente(token: Optional[str]):
@@ -413,18 +419,83 @@ ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "agent_3301m2v4ewgxf
 
 @app.post("/voz/url-firmada")
 async def voz_url_firmada(x_cevi_token: Optional[str] = X_TOKEN):
-    if not identidad.verificar_token(x_cevi_token):
+    ident = identidad.verificar_token(x_cevi_token)
+    if not ident:
         return JSONResponse({"error": "sin sesión"}, status_code=401)
     key = os.environ.get("ELEVENLABS_API_KEY")
     if not key:
         return JSONResponse({"error": "voz no configurada"}, status_code=503)
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get("https://api.elevenlabs.io/v1/convai/conversation/get-signed-url",
-                             params={"agent_id": ELEVENLABS_AGENT_ID}, headers={"xi-api-key": key})
+                             params={"agent_id": ELEVENLABS_AGENT_ID, "include_conversation_id": "true"},
+                             headers={"xi-api-key": key})
     if r.status_code != 200:
         log.error("get-signed-url HTTP %s: %s", r.status_code, r.text[:200])
         return JSONResponse({"error": "no se pudo iniciar la voz"}, status_code=502)
-    return {"signed_url": r.json().get("signed_url")}
+    url = r.json().get("signed_url")
+    # El conversation_id viene asignado en la URL: se ata aquí al cliente
+    # verificado, para que el resumen post-llamada vaya a SU ficha.
+    try:
+        from urllib.parse import urlparse, parse_qs
+        conv = (parse_qs(urlparse(url).query).get("conversation_id") or [None])[0]
+        if conv:
+            cli = identidad.contacto(ident["doc"], ident["pais"])
+            conversaciones.registrar_emision(conv, ident["doc"], ident["pais"], (cli or {}).get("partner_id"))
+    except Exception:
+        log.exception("No se pudo registrar la conversación emitida")
+    # Identificador opaco y estable del cliente para el historial de ElevenLabs
+    # (evita que el widget use una huella del navegador; no revela el documento).
+    uid = "cli_" + hmac.new(os.environ.get("CEVI_IDENTITY_SECRET", "").encode(), ident["doc"].encode(), hashlib.sha256).hexdigest()[:16]
+    return {"signed_url": url, "user_id": uid}
+
+
+# ── Post-call webhook de ElevenLabs ────────────────────────────────────────
+# Firma: header "elevenlabs-signature: t=<unix>,v0=<hex>", hex = HMAC-SHA256(
+# secreto, f"{t}.{cuerpo_crudo}"). Se verifica con el cuerpo CRUDO (si se
+# re-serializa el JSON la firma no coincide) y con 30 min de tolerancia.
+def _firma_valida(crudo: bytes, cabecera: str, secreto: str) -> bool:
+    ts, firmas = None, []
+    for parte in (cabecera or "").split(","):
+        parte = parte.strip()
+        if parte.startswith("t="):
+            ts = parte[2:]
+        elif parte.startswith("v0="):
+            firmas.append(parte[3:])
+    if not ts or not firmas or not secreto:
+        return False
+    try:
+        if abs(time.time() - int(ts)) > 1800:
+            return False
+    except ValueError:
+        return False
+    esperada = hmac.new(secreto.encode(), f"{ts}.".encode() + crudo, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(esperada, f) for f in firmas)
+
+
+@app.post("/webhook/post-llamada")
+async def webhook_post_llamada(request: Request):
+    crudo = await request.body()
+    if not _firma_valida(crudo, request.headers.get("elevenlabs-signature", ""), os.environ.get("ELEVENLABS_WEBHOOK_SECRET", "")):
+        return JSONResponse({"error": "firma inválida"}, status_code=401)
+    try:
+        ev = json.loads(crudo)
+    except Exception:
+        return JSONResponse({"error": "json inválido"}, status_code=400)
+    if ev.get("type") != "post_call_transcription":
+        return {"ok": True, "ignorado": ev.get("type")}
+    data = ev.get("data") or {}
+    try:
+        fila = conversaciones.guardar_post_llamada(data)
+    except Exception:
+        log.exception("post-llamada: no se pudo guardar")
+        return JSONResponse({"error": "no se pudo guardar"}, status_code=500)  # 5xx → ElevenLabs reintenta
+    if fila and fila.get("partner_id") and not fila.get("nota_odoo") and odoo_client.enabled():
+        try:
+            odoo_client.nota_llamada_voz(fila["partner_id"], fila)
+            conversaciones.marcar_nota(fila["conversation_id"])
+        except Exception:
+            log.exception("post-llamada: no se pudo dejar la nota en Odoo")
+    return {"ok": True}
 
 
 class BuscarClienteReq(BaseModel):
@@ -477,9 +548,30 @@ async def webhook_consultar_tickets(x_cevi_secret: Optional[str] = X_SECRET, x_c
     return {"ok": True, "tickets": tickets, "abiertos": sum(1 for t in tickets if t["abierto"])}
 
 
+# Con ruido de taller el modelo puede reintentar una tool: si en la misma
+# conversación llega otra vez el mismo pedido en 10 minutos, se devuelve el
+# caso ya creado en vez de abrir otro.
+_RECIENTES = {}
+
+def _ya_creado(conversation_id, tool, texto):
+    if not conversation_id:
+        return None, None
+    clave = f"{conversation_id}|{tool}|{hashlib.sha1((texto or '').strip().lower().encode()).hexdigest()}"
+    ahora = time.time()
+    for k in [k for k, (t, _) in _RECIENTES.items() if ahora - t > 600]:
+        _RECIENTES.pop(k, None)
+    previo = _RECIENTES.get(clave)
+    return clave, (previo[1] if previo else None)
+
+
+def _conv_txt(conversation_id):
+    return f" · Conversación ElevenLabs: {conversation_id}" if conversation_id else ""
+
+
 class CrearTicketReq(BaseModel):
     descripcion: str
     telefono: Optional[str] = None
+    conversation_id: Optional[str] = None
     ya_intento: Optional[str] = None
     serie: Optional[str] = None
     urgencia: Optional[str] = "normal"
@@ -492,15 +584,21 @@ async def webhook_crear_ticket(req: CrearTicketReq, x_cevi_secret: Optional[str]
     if not odoo_client.enabled():
         return SIN_ODOO
     cli = _cliente(x_cevi_token)
+    clave, previo = _ya_creado(req.conversation_id, "crear", req.descripcion)
+    if previo:
+        return {"ok": True, "ticket": previo, "mensaje_cliente": "Ese caso ya quedó registrado; un técnico lo revisa y te escribe por WhatsApp."}
     try:
         r = odoo_client.crear_ticket_voz(
             (cli or {}).get("telefono") or req.telefono, req.descripcion, ya_intento=req.ya_intento,
             serie=req.serie, urgencia=req.urgencia or "normal",
-            partner_id=(cli or {}).get("partner_id"), contexto=_contexto_maquina(cli) if cli else None,
+            partner_id=(cli or {}).get("partner_id"),
+            contexto=((_contexto_maquina(cli) if cli else "") + _conv_txt(req.conversation_id)) or None,
         )
     except Exception:
         log.exception("crear_ticket (voz) error")
         return SIN_ODOO
+    if clave:
+        _RECIENTES[clave] = (time.time(), r["ticket"])
     return {"ok": True, "ticket": r["ticket"],
             "mensaje_cliente": "Tu caso quedó registrado; un técnico lo revisa y te escribe por WhatsApp."}
 
@@ -509,6 +607,7 @@ class DerivarAsesorReq(BaseModel):
     motivo: str
     resumen: str
     telefono: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 @app.post("/webhook/derivar-asesor")
 async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[str] = X_SECRET,
@@ -518,16 +617,22 @@ async def webhook_derivar_asesor(req: DerivarAsesorReq, x_cevi_secret: Optional[
     if not odoo_client.enabled():
         return SIN_ODOO
     cli = _cliente(x_cevi_token)
+    clave, previo = _ya_creado(req.conversation_id, "derivar", req.resumen)
+    if previo:
+        return {"ok": True, "ticket": previo, "mensaje_cliente": "Ya le avisé al equipo; un asesor de C4V te escribe por WhatsApp."}
     try:
         r = odoo_client.crear_ticket_voz(
             (cli or {}).get("telefono") or req.telefono, req.resumen,
             urgencia="alta" if req.motivo == "seguridad" else "normal", motivo=req.motivo,
-            partner_id=(cli or {}).get("partner_id"), contexto=_contexto_maquina(cli) if cli else None,
+            partner_id=(cli or {}).get("partner_id"),
+            contexto=((_contexto_maquina(cli) if cli else "") + _conv_txt(req.conversation_id)) or None,
             titulo=f"Derivación ({req.motivo}): {req.resumen}",
         )
     except Exception:
         log.exception("derivar_asesor (voz) error")
         return SIN_ODOO
+    if clave:
+        _RECIENTES[clave] = (time.time(), r["ticket"])
     return {"ok": True, "ticket": r["ticket"],
             "mensaje_cliente": "Un asesor de C4V te escribe por WhatsApp en cuanto revise tu caso."}
 
@@ -538,6 +643,7 @@ class AgendarVisitaReq(BaseModel):
     fecha_preferida: Optional[str] = None
     horario_preferido: Optional[str] = None
     telefono: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 @app.post("/webhook/agendar-visita")
 async def webhook_agendar_visita(req: AgendarVisitaReq, x_cevi_secret: Optional[str] = X_SECRET,
@@ -552,15 +658,21 @@ async def webhook_agendar_visita(req: AgendarVisitaReq, x_cevi_secret: Optional[
     tipo = {"videollamada": "videollamada", "visita_presencial": "visita presencial", "llamada": "llamada"}.get(req.tipo, req.tipo)
     detalle = (f"Solicitud de {tipo} con un técnico. Motivo: {req.motivo}. "
                f"Fecha preferida: {req.fecha_preferida or 'sin preferencia'}. Horario: {req.horario_preferido or 'sin preferencia'}.")
+    clave, previo = _ya_creado(req.conversation_id, "agendar", req.motivo)
+    if previo:
+        return {"ok": True, "solicitud": previo, "mensaje_cliente": f"Tu solicitud de {tipo} ya quedó registrada; un técnico te escribe para confirmar."}
     try:
         r = odoo_client.crear_ticket_voz(
             (cli or {}).get("telefono") or req.telefono, detalle,
-            partner_id=(cli or {}).get("partner_id"), contexto=_contexto_maquina(cli) if cli else None,
+            partner_id=(cli or {}).get("partner_id"),
+            contexto=((_contexto_maquina(cli) if cli else "") + _conv_txt(req.conversation_id)) or None,
             titulo=f"Agendar {tipo}: {req.motivo}", motivo="agenda",
         )
     except Exception:
         log.exception("agendar_visita error")
         return SIN_ODOO
+    if clave:
+        _RECIENTES[clave] = (time.time(), r["ticket"])
     return {"ok": True, "solicitud": r["ticket"],
             "mensaje_cliente": f"Dejé tu solicitud de {tipo}. Un técnico te escribe por WhatsApp para confirmar día y hora."}
 
