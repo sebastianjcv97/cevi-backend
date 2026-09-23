@@ -66,6 +66,15 @@ def contacto(doc, pais=""):
                 limit 1""",
             (doc, (pais or "").upper()),
         ).fetchone()
+        # Clientes sin DNI/RUC en Odoo: el portal los identifica como "P<id de
+        # Odoo>" (login por teléfono, 23-set-2026). Si no hay ficha con ese
+        # documento, se busca por el id de Odoo.
+        if not fila and doc[:1].upper() == "P" and doc[1:].isdigit():
+            fila = conn.execute(
+                """select odoo_partner_id, nombre, pais, ciudad, telefono, maquinas, empresa_vendedora
+                     from c4v.portal_contacts where odoo_partner_id = %s limit 1""",
+                (int(doc[1:]),),
+            ).fetchone()
     if not fila:
         return None
     pid, nombre, pais_, ciudad, tel, maquinas, empresa = fila

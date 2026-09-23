@@ -324,13 +324,18 @@ _ETAPA_CLIENTE = {
 
 
 def tickets_de_partner(partner_id, limite=5):
-    """Últimos casos del cliente, con su estado en palabras simples."""
+    """Casos del cliente con su estado en palabras simples: TODOS los abiertos
+    (hasta 10) y los últimos cerrados. Antes eran solo los 5 más recientes y un
+    caso abierto viejo podía quedar fuera de la lista (el agente decía que no
+    existía)."""
     _connect()
-    recs = _ex(
-        "helpdesk.ticket", "search_read", [["partner_id", "=", int(partner_id)]],
-        fields=["ticket_ref", "name", "stage_id", "create_date", "write_date", "priority"],
-        order="create_date desc", limit=limite,
-    )
+    campos = ["ticket_ref", "name", "stage_id", "create_date", "write_date", "priority"]
+    base = [["partner_id", "=", int(partner_id)]]
+    abiertos = _ex("helpdesk.ticket", "search_read", base + [["stage_id.fold", "=", False]],
+                   fields=campos, order="create_date desc", limit=10)
+    cerrados = _ex("helpdesk.ticket", "search_read", base + [["stage_id.fold", "=", True]],
+                   fields=campos, order="write_date desc", limit=3)
+    recs = abiertos + cerrados
     out = []
     for r in recs:
         etapa = r["stage_id"][1] if r.get("stage_id") else ""
