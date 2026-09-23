@@ -534,3 +534,100 @@ def nota_llamada_voz(partner_id, fila):
         partes.append(f"<p>🔎 <b>Revisar esta conversación</b> — falló la evaluación automática de: {_esc(', '.join(fallos))}.</p>")
     partes.append(f"<p><i>Conversación ElevenLabs: {_esc(fila.get('conversation_id') or '')}</i></p>")
     _ex("res.partner", "message_post", [int(partner_id)], body="".join(partes), subtype_xmlid="mail.mt_note")
+
+
+# ── CeVi comercial (página pública /ventas) ─────────────────────────────────
+# Decisiones del dueño (24-set-2026), sobre cómo trabaja hoy el CRM: las
+# vendedoras cargan cada oportunidad al cotizar, asignada a sí mismas, y el
+# tablero abre filtrado por "asignadas a mí" (sin asignación automática). Así
+# que el prospecto de CeVi va a Melva, en C4V LASER S.C.R.L. (la empresa que
+# usan en setiembre; la del usuario API es KUY y ellas no la ven), equipo
+# Ventas Peru, con la etiqueta "CeVi voz" y la fuente "CeVi web ventas" para
+# distinguirlo y medir. Sin contacto (res.partner): la vendedora lo liga con el
+# DNI/RUC al cotizar; aquí solo van nombre y teléfono.
+VENTAS_VENDEDORA = int(os.environ.get("CEVI_VENTAS_VENDEDORA") or 9)      # Melva
+VENTAS_EMPRESA = int(os.environ.get("CEVI_VENTAS_EMPRESA") or 13)         # C4V LASER S.C.R.L.
+VENTAS_EQUIPO = 5                                                         # Ventas Peru
+VENTAS_ETIQUETA = "CeVi voz"
+VENTAS_FUENTE = "CeVi web ventas"
+VENTAS_MEDIO = 12                                                         # utm.medium "Chat en vivo"
+VENTAS_PAISES = {"PE": 173, "EC": 63, "BO": 29}
+_INTERES_TXT = {"comprar": "quiere comprar", "cotizar": "pide cotización", "formas_de_pago": "pregunta formas de pago",
+                "envio": "pregunta por el envío", "visita": "quiere visitar / ver la máquina", "taller": "le interesan los talleres",
+                "informacion": "pide más información"}
+
+
+def _tel_legible(tel):
+    """'+51995547575' → '+51 995 547 575' (como los carga el equipo)."""
+    d = "".join(ch for ch in (tel or "") if ch.isdigit())
+    for pref in ("593", "591", "51", "56", "57"):
+        if d.startswith(pref):
+            resto = d[len(pref):]
+            return f"+{pref} " + " ".join(resto[i:i + 3] for i in range(0, len(resto), 3))
+    return tel
+
+
+def crear_lead_voz(nombre, telefono, pais=None, ciudad=None, rubro=None, etapa=None, modelo_interes=None,
+                   interes=None, resumen=None, email=None, conversation_id=None):
+    """Prospecto del CeVi comercial → oportunidad en el CRM, visible para la
+    vendedora. Si el mismo número dejó datos en los últimos 30 días, no
+    duplica: agrega una nota a esa oportunidad. Devuelve {'lead_id', 'existia'}."""
+    _connect()
+    ctx = {"allowed_company_ids": [VENTAS_EMPRESA], "lang": "es_PE"}
+    tel = _tel_legible(telefono)
+    previos = _ex("crm.lead", "search", [["phone", "in", list({tel, telefono})], ["type", "=", "opportunity"],
+                                          ["create_date", ">=", time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400))]],
+                  limit=1, context=ctx)
+    detalle = [
+        f"<li><b>Qué quiere:</b> {_esc(_INTERES_TXT.get(interes, interes or '—'))}</li>",
+        f"<li><b>Qué va a producir / rubro:</b> {_esc(rubro or '—')}</li>",
+        f"<li><b>Etapa:</b> {_esc(etapa or '—')}</li>",
+        f"<li><b>Modelo de interés:</b> {_esc(modelo_interes or '—')}</li>",
+        f"<li><b>País / ciudad:</b> {_esc(pais or '—')} / {_esc(ciudad or '—')}</li>",
+        f"<li><b>Correo:</b> {_esc(email)}</li>" if email else "",
+    ]
+    cuerpo = ("<p><b>🎙️ Interesado desde CeVi (página pública de ventas)</b></p><ul>" + "".join(detalle) + "</ul>"
+              f"<p>{_esc(resumen or '')}</p>"
+              + (f"<p><i>Conversación ElevenLabs: {_esc(conversation_id)}</i></p>" if conversation_id else ""))
+    if previos:
+        if not SIMULAR:
+            _ex("crm.lead", "message_post", previos, body=cuerpo, subtype_xmlid="mail.mt_note", context=ctx)
+        return {"lead_id": previos[0], "existia": True}
+    etiqueta = None if SIMULAR else _find_or_create("crm.tag", [["name", "=", VENTAS_ETIQUETA]], {"name": VENTAS_ETIQUETA})
+    vals = {
+        "name": f"{modelo_interes} · CeVi voz" if modelo_interes else f"CeVi voz · {nombre}",
+        "type": "opportunity", "contact_name": nombre, "phone": tel, "email_from": email or False,
+        "team_id": VENTAS_EQUIPO, "company_id": VENTAS_EMPRESA, "user_id": VENTAS_VENDEDORA, "stage_id": 1,
+        "lang_id": 78, "country_id": VENTAS_PAISES.get((pais or "").upper(), False), "city": ciudad or False,
+        "tag_ids": [(6, 0, [etiqueta])] if etiqueta else False,
+        "source_id": None if SIMULAR else _origen_crm(VENTAS_FUENTE), "medium_id": VENTAS_MEDIO,
+        "priority": "1" if interes in ("comprar", "cotizar") else "0",
+        "material": (rubro or "")[:120] or False, "description": cuerpo,
+    }
+    if SIMULAR:
+        log.info("SIMULAR crm.lead.create (ventas) %s", vals)
+        return {"lead_id": 0, "existia": False}
+    return {"lead_id": _ex("crm.lead", "create", vals, context=ctx), "existia": False}
+
+
+def nota_lead_voz(lead_id, fila):
+    """Resumen post-llamada del CeVi comercial en la oportunidad creada en esa
+    conversación (lo que se habló después de dejar los datos incluido)."""
+    _connect()
+    d = fila.get("datos") or {}
+    dur = fila.get("duracion_s")
+    fallos = [k for k, v in (fila.get("criterios") or {}).items() if v == "failure"]
+    partes = [
+        "<p><b>🎙️ Conversación con CeVi (ventas)</b></p>",
+        f"<p>{_esc(fila.get('resumen') or 'Sin resumen.')}</p><ul>",
+        f"<li><b>Interés:</b> {_esc(str(d.get('nivel_interes') or '—'))}</li>",
+        f"<li><b>Modelo recomendado:</b> {_esc(str(d.get('modelo_recomendado') or '—'))}</li>",
+        f"<li><b>Preguntó precio:</b> {'sí' if d.get('pidio_precio') else 'no'}</li>",
+        f"<li><b>Duración:</b> {dur // 60} min {dur % 60} s</li>" if isinstance(dur, int) else "",
+        "</ul>",
+    ]
+    if fallos:
+        partes.append(f"<p>🔎 <b>Revisar esta conversación</b> — falló la evaluación automática de: {_esc(', '.join(fallos))}.</p>")
+    partes.append(f"<p><i>Conversación ElevenLabs: {_esc(fila.get('conversation_id') or '')}</i></p>")
+    _ex("crm.lead", "message_post", [int(lead_id)], body="".join(partes), subtype_xmlid="mail.mt_note",
+        context={"allowed_company_ids": [VENTAS_EMPRESA]})

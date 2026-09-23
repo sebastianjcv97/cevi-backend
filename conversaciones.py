@@ -47,6 +47,10 @@ create table if not exists c4v.cevi_conversaciones (
   nota_odoo         boolean default false
 );
 create index if not exists cevi_conv_partner on c4v.cevi_conversaciones (odoo_partner_id);
+-- 24-set-2026: también el CeVi comercial (público). `agente` distingue soporte
+-- de ventas y `lead_id` es la oportunidad de Odoo CRM creada en la conversación.
+alter table c4v.cevi_conversaciones add column if not exists agente text not null default 'soporte';
+alter table c4v.cevi_conversaciones add column if not exists lead_id integer;
 """
 
 _listo = False
@@ -73,15 +77,24 @@ def asegurar_tabla():
     _listo, _ultima_purga = True, time.time()
 
 
-def registrar_emision(conversation_id, doc, pais, partner_id):
-    """Ata el conversation_id (aún no usado) al cliente verificado."""
+def registrar_emision(conversation_id, doc, pais, partner_id, agente="soporte"):
+    """Ata el conversation_id (aún no usado) al cliente verificado. En el CeVi
+    comercial no hay cliente: doc y partner van vacíos y agente='ventas'."""
     asegurar_tabla()
     with _conn() as c:
         c.execute(
-            """insert into c4v.cevi_conversaciones (conversation_id, documento_norm, pais, odoo_partner_id)
-               values (%s, %s, %s, %s) on conflict (conversation_id) do nothing""",
-            (conversation_id, doc, pais, partner_id),
+            """insert into c4v.cevi_conversaciones (conversation_id, documento_norm, pais, odoo_partner_id, agente)
+               values (%s, %s, %s, %s, %s) on conflict (conversation_id) do nothing""",
+            (conversation_id, doc, pais, partner_id, agente),
         )
+
+
+def marcar_lead(conversation_id, lead_id):
+    """Anota la oportunidad de Odoo creada en esta conversación (CeVi comercial)."""
+    asegurar_tabla()
+    with _conn() as c:
+        c.execute("update c4v.cevi_conversaciones set lead_id = %s where conversation_id = %s",
+                  (lead_id, conversation_id))
 
 
 def guardar_post_llamada(data):
@@ -105,7 +118,7 @@ def guardar_post_llamada(data):
                  resuelto = %s, requiere_humano = %s, riesgo_seguridad = %s, numero_caso = %s,
                  criterios = %s, datos = %s, tools = %s
                where conversation_id = %s
-               returning odoo_partner_id, documento_norm, nota_odoo""",
+               returning odoo_partner_id, documento_norm, nota_odoo, agente, lead_id""",
             (
                 meta.get("call_duration_secs"), meta.get("termination_reason"), an.get("transcript_summary"),
                 dc.get("motivo"), dc.get("sintoma"), dc.get("resuelto_en_llamada"), dc.get("requiere_humano"),
@@ -116,6 +129,7 @@ def guardar_post_llamada(data):
     if not fila:
         return None
     return {"conversation_id": conv, "partner_id": fila[0], "doc": fila[1], "nota_odoo": fila[2],
+            "agente": fila[3], "lead_id": fila[4],
             "resumen": an.get("transcript_summary") or "", "criterios": crit, "datos": dc,
             "duracion_s": meta.get("call_duration_secs"), "tools": tools}
 

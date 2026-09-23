@@ -35,6 +35,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# CeVi comercial (página pública /ventas): URL firmada sin login y lead en Odoo CRM.
+import ventas  # noqa: E402
+app.include_router(ventas.router)
+
 # ───────────────────────────────────────────────────────────────
 # CONFIG (Capa 3 — editable)
 # ───────────────────────────────────────────────────────────────
@@ -602,10 +606,17 @@ async def webhook_post_llamada(request: Request):
     # Odoo con notas vacías.
     hablo = any(t.get("role") == "user" and (t.get("message") or "").strip()
                 for t in data.get("transcript") or [])
-    if fila and hablo and fila.get("partner_id") and not fila.get("nota_odoo") and odoo_client.enabled():
+    if fila and hablo and not fila.get("nota_odoo") and odoo_client.enabled():
         try:
-            odoo_client.nota_llamada_voz(fila["partner_id"], fila)
-            conversaciones.marcar_nota(fila["conversation_id"])
+            if fila.get("agente") == "ventas":
+                # CeVi comercial: el resumen va a la oportunidad creada en la
+                # llamada (si la persona no dejó datos, no hay dónde anotarlo).
+                if fila.get("lead_id"):
+                    await run_in_threadpool(odoo_client.nota_lead_voz, fila["lead_id"], fila)
+                    conversaciones.marcar_nota(fila["conversation_id"])
+            elif fila.get("partner_id"):
+                odoo_client.nota_llamada_voz(fila["partner_id"], fila)
+                conversaciones.marcar_nota(fila["conversation_id"])
         except Exception:
             log.exception("post-llamada: no se pudo dejar la nota en Odoo")
     return {"ok": True}
