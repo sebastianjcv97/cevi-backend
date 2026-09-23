@@ -14,6 +14,7 @@ import os
 import logging
 from typing import Optional
 from fastapi import FastAPI, Header, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -417,30 +418,58 @@ X_TOKEN = Header(None, alias="X-CeVi-Token")
 # iniciar la conversación, y el portal pide una nueva antes de cada llamada.
 ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "agent_3301m2v4ewgxf3sbrjs695yj3ct0")
 
+# El portal pide varias URLs por visita: una la gasta el widget al leer su
+# configuración y mantiene 2 de reserva (cada URL sirve una sola llamada y
+# vence a los 15 min). El tope por cliente evita que un token filtrado sirva
+# para abrir conversaciones sin límite.
+_URLS_POR_DOC: dict = {}
+URLS_MAX, URLS_VENTANA = 40, 600
+
+
+def _demasiadas_urls(doc: str) -> bool:
+    ahora = time.time()
+    marcas = [t for t in _URLS_POR_DOC.get(doc, []) if ahora - t < URLS_VENTANA]
+    if len(marcas) >= URLS_MAX:
+        _URLS_POR_DOC[doc] = marcas
+        return True
+    marcas.append(ahora)
+    _URLS_POR_DOC[doc] = marcas
+    return False
+
+
 @app.post("/voz/url-firmada")
 async def voz_url_firmada(x_cevi_token: Optional[str] = X_TOKEN):
     ident = identidad.verificar_token(x_cevi_token)
     if not ident:
         return JSONResponse({"error": "sin sesión"}, status_code=401)
+    if _demasiadas_urls(ident["doc"]):
+        return JSONResponse({"error": "demasiadas solicitudes"}, status_code=429)
     key = os.environ.get("ELEVENLABS_API_KEY")
     if not key:
         return JSONResponse({"error": "voz no configurada"}, status_code=503)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get("https://api.elevenlabs.io/v1/convai/conversation/get-signed-url",
-                             params={"agent_id": ELEVENLABS_AGENT_ID, "include_conversation_id": "true"},
-                             headers={"xi-api-key": key})
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get("https://api.elevenlabs.io/v1/convai/conversation/get-signed-url",
+                                 params={"agent_id": ELEVENLABS_AGENT_ID, "include_conversation_id": "true"},
+                                 headers={"xi-api-key": key})
+    except httpx.HTTPError as e:
+        log.error("get-signed-url sin respuesta: %s", e)
+        return JSONResponse({"error": "no se pudo iniciar la voz"}, status_code=502)
     if r.status_code != 200:
         log.error("get-signed-url HTTP %s: %s", r.status_code, r.text[:200])
         return JSONResponse({"error": "no se pudo iniciar la voz"}, status_code=502)
     url = r.json().get("signed_url")
     # El conversation_id viene asignado en la URL: se ata aquí al cliente
-    # verificado, para que el resumen post-llamada vaya a SU ficha.
+    # verificado, para que el resumen post-llamada vaya a SU ficha. Postgres
+    # es síncrono: va en un hilo aparte para no frenar las demás peticiones.
     try:
         from urllib.parse import urlparse, parse_qs
         conv = (parse_qs(urlparse(url).query).get("conversation_id") or [None])[0]
         if conv:
-            cli = identidad.contacto(ident["doc"], ident["pais"])
-            conversaciones.registrar_emision(conv, ident["doc"], ident["pais"], (cli or {}).get("partner_id"))
+            def _registrar():
+                cli = identidad.contacto(ident["doc"], ident["pais"])
+                conversaciones.registrar_emision(conv, ident["doc"], ident["pais"], (cli or {}).get("partner_id"))
+            await run_in_threadpool(_registrar)
     except Exception:
         log.exception("No se pudo registrar la conversación emitida")
     # Identificador opaco y estable del cliente para el historial de ElevenLabs
@@ -489,7 +518,12 @@ async def webhook_post_llamada(request: Request):
     except Exception:
         log.exception("post-llamada: no se pudo guardar")
         return JSONResponse({"error": "no se pudo guardar"}, status_code=500)  # 5xx → ElevenLabs reintenta
-    if fila and fila.get("partner_id") and not fila.get("nota_odoo") and odoo_client.enabled():
+    # Una conversación en la que el cliente no dijo nada (se abrió y se cerró,
+    # o una prueba de conexión) queda en Postgres, pero no llena la ficha de
+    # Odoo con notas vacías.
+    hablo = any(t.get("role") == "user" and (t.get("message") or "").strip()
+                for t in data.get("transcript") or [])
+    if fila and hablo and fila.get("partner_id") and not fila.get("nota_odoo") and odoo_client.enabled():
         try:
             odoo_client.nota_llamada_voz(fila["partner_id"], fila)
             conversaciones.marcar_nota(fila["conversation_id"])

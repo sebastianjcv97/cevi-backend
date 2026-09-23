@@ -11,12 +11,15 @@ Registro de conversaciones de voz de CeVi (c4v.cevi_conversaciones)
    Se guardan en la misma fila y se deja una nota en la ficha de Odoo del
    cliente, para que el equipo vea qué habló con CeVi sin abrir ElevenLabs.
 
-Muchas URLs firmadas nunca se usan (se renuevan cada 9 min): esas filas quedan
-en estado 'url_emitida' y se borran solas a los 2 días.
+Muchas URLs firmadas nunca se usan: la que el widget gasta al leer su
+configuración, y las de reserva que vencen sin llamada (el portal mantiene 2).
+Esas filas quedan en estado 'url_emitida' y se borran a los 2 días (la purga
+corre al arrancar y después cada 6 horas, al emitir una URL).
 """
 import json
 import logging
 import os
+import time
 
 log = logging.getLogger("cevi.conversaciones")
 
@@ -47,6 +50,8 @@ create index if not exists cevi_conv_partner on c4v.cevi_conversaciones (odoo_pa
 """
 
 _listo = False
+_ultima_purga = 0.0
+PURGA_CADA = 6 * 3600
 
 
 def _conn():
@@ -55,13 +60,17 @@ def _conn():
 
 
 def asegurar_tabla():
-    global _listo
-    if _listo or not os.environ.get("POSTGRES_URL"):
+    global _listo, _ultima_purga
+    if not os.environ.get("POSTGRES_URL"):
+        return
+    purgar = time.time() - _ultima_purga > PURGA_CADA
+    if _listo and not purgar:
         return
     with _conn() as c:
-        c.execute(DDL)
+        if not _listo:
+            c.execute(DDL)
         c.execute("delete from c4v.cevi_conversaciones where estado = 'url_emitida' and emitida_at < now() - interval '2 days'")
-    _listo = True
+    _listo, _ultima_purga = True, time.time()
 
 
 def registrar_emision(conversation_id, doc, pais, partner_id):
