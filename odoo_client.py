@@ -48,8 +48,8 @@ _ctx.verify_mode = ssl.CERT_NONE
 # título en mayúsculas ("SOPORTE TECNICO - 13100U - ...") y la ficha del
 # cliente en la descripción. Las PRUEBAS (contacto verificado con la categoría
 # "CeVi Demo", como Martín) siguen en el tablero "CeVi" (14).
-# Lo comercial no es un caso: es una oportunidad en el CRM (Ventas Perú,
-# Bolivia o Ecuador), donde trabajan los asesores.
+# Lo comercial no es un caso: es una oportunidad en el CRM, donde trabajan
+# las vendedoras (a quién y en qué empresa: constantes VENTAS_*, más abajo).
 EQUIPO_REAL = int(os.environ.get("CEVI_EQUIPO_REAL") or 12)
 SIMULAR = os.environ.get("CEVI_ODOO_SIMULAR") == "1"   # solo registra en el log lo que crearía
 ETIQUETA_TIPO = {
@@ -59,8 +59,6 @@ ETIQUETA_TIPO = {
     "repuesto": "INSTALACION REPUESTO",
 }
 ETIQUETAS_NUEVAS = {"SOPORTE TECNICO", "SEGURIDAD"}   # creación aprobada por Sebastián (23-set-2026)
-CRM_EQUIPO = {"PE": 5, "BO": 7, "EC": 6}               # Ventas Peru / Ventas Bolivia / Ventas Ecuador
-CRM_EMPRESA = {"BO": 3, "EC": 4}                       # Perú: la empresa que le vendió (1 o 13); si no, 1
 
 _lock = threading.Lock()
 _state = {
@@ -424,44 +422,32 @@ def _origen_crm(nombre):
     return _state["origenes"][nombre]
 
 
-def _empresa_de_maquina(maquina):
-    """Empresa que le vendió la máquina: la de la ficha o, si no está, la del pedido."""
-    emp = (maquina or {}).get("empresa_id")
-    if emp:
-        return emp
-    if (maquina or {}).get("pedido"):
-        rec = _ex("sale.order", "search_read", [["name", "=", maquina["pedido"]]], fields=["company_id"], limit=1)
-        if rec and rec[0].get("company_id"):
-            return rec[0]["company_id"][0]
-    return None
-
-
 def crear_oportunidad_voz(nombre, cuerpo_html, partner_id=None, telefono=None, pais="PE", maquina=None,
                           origen="CeVi soporte"):
-    """Consulta comercial → oportunidad en el CRM (etapa New, asignada al líder
-    del equipo de ventas del país), como las que cargan los asesores. `origen` va
-    como fuente (utm.source) para distinguir de dónde vino ("CeVi soporte",
-    "CeVi web ventas"). Devuelve {'ticket', 'partner_id'}."""
+    """Consulta comercial de un cliente → oportunidad en el CRM como las que
+    cargan las vendedoras. Mismas reglas que el CeVi comercial (decisión de
+    Sebastián, 24-set-2026, constantes VENTAS_*): Ventas Peru, empresa C4V
+    LASER, asignada a Melva (sin responsable nadie la ve: el CRM abre
+    filtrado por "asignadas a mí"), etiqueta "CeVi voz" y su propia fuente
+    (`origen`) para medir de dónde vino. El país va en country_id: Melva solo
+    ve las empresas 13 y 1, así que Bolivia y Ecuador no van a otra empresa.
+    Devuelve {'ticket', 'partner_id'}."""
     _connect()
+    ctx = {"allowed_company_ids": [VENTAS_EMPRESA], "lang": "es_PE"}
     pid = int(partner_id) if partner_id else _contacto_sin_verificar(telefono)
-    pais = (pais or "PE").upper()[:2]
-    emp_maq = _empresa_de_maquina(maquina)
-    empresa = CRM_EMPRESA.get(pais) or (emp_maq if emp_maq in (1, 13) else 1)
-    equipo = CRM_EQUIPO.get(pais, 5)
-    # El tablero del CRM abre filtrado por "asignadas a mí" y no hay asignación
-    # automática: sin responsable, ninguna vendedora la vería. Va al líder del
-    # equipo de ventas (en Perú, Jose), que la reparte; si no tiene, sin asignar.
-    lider = _ex("crm.team", "read", [equipo], fields=["user_id"])
-    responsable = (lider[0].get("user_id") or [False])[0] if lider else False
-    vals = {"name": nombre, "type": "opportunity", "partner_id": pid, "team_id": equipo,
-            "company_id": empresa, "user_id": responsable, "description": cuerpo_html}
-    fuente = _origen_crm(origen) if not SIMULAR else None
+    vals = {"name": nombre, "type": "opportunity", "partner_id": pid, "team_id": VENTAS_EQUIPO,
+            "company_id": VENTAS_EMPRESA, "user_id": VENTAS_VENDEDORA, "stage_id": 1, "lang_id": 78,
+            "country_id": VENTAS_PAISES.get((pais or "PE").upper()[:2], False), "medium_id": VENTAS_MEDIO,
+            "description": cuerpo_html}
+    if SIMULAR:
+        log.info("SIMULAR crm.lead.create (soporte) %s", vals)
+        return {"ticket": "SIMULADO", "partner_id": pid}
+    etiqueta = _find_or_create("crm.tag", [["name", "=", VENTAS_ETIQUETA]], {"name": VENTAS_ETIQUETA})
+    vals["tag_ids"] = [(6, 0, [etiqueta])]
+    fuente = _origen_crm(origen)
     if fuente:
         vals["source_id"] = fuente
-    if SIMULAR:
-        log.info("SIMULAR crm.lead.create %s", vals)
-        return {"ticket": "SIMULADO", "partner_id": pid}
-    lid = _ex("crm.lead", "create", vals)
+    lid = _ex("crm.lead", "create", vals, context=ctx)
     return {"ticket": f"oportunidad {lid}", "partner_id": pid}
 
 
