@@ -538,6 +538,10 @@ VENTAS_ETIQUETA = "CeVi voz"
 VENTAS_FUENTE = "CeVi web ventas"
 VENTAS_MEDIO = 12                                                         # utm.medium "Chat en vivo"
 VENTAS_PAISES = {"PE": 173, "EC": 63, "BO": 29}
+# Números de prueba (Martín, cliente demo): la oportunidad se crea igual para
+# verificar todo, pero sin responsable y archivada, así no le llega el aviso
+# "Te asignaron…" a la vendedora (pasó en la primera prueba, 23-set-2026).
+VENTAS_TELEFONOS_PRUEBA = {t.strip() for t in (os.environ.get("CEVI_VENTAS_TELEFONOS_PRUEBA") or "+51 995 547 575").split(",")}
 _INTERES_TXT = {"comprar": "quiere comprar", "cotizar": "pide cotización", "formas_de_pago": "pregunta formas de pago",
                 "envio": "pregunta por el envío", "visita": "quiere visitar / ver la máquina", "taller": "le interesan los talleres",
                 "informacion": "pide más información"}
@@ -561,6 +565,8 @@ def crear_lead_voz(nombre, telefono, pais=None, ciudad=None, rubro=None, etapa=N
     _connect()
     ctx = {"allowed_company_ids": [VENTAS_EMPRESA], "lang": "es_PE"}
     tel = _tel_legible(telefono)
+    if tel in VENTAS_TELEFONOS_PRUEBA:
+        ctx["active_test"] = False
     previos = _ex("crm.lead", "search", [["phone", "in", list({tel, telefono})], ["type", "=", "opportunity"],
                                           ["create_date", ">=", time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400))]],
                   limit=1, context=ctx)
@@ -590,6 +596,8 @@ def crear_lead_voz(nombre, telefono, pais=None, ciudad=None, rubro=None, etapa=N
         "priority": "1" if interes in ("comprar", "cotizar") else "0",
         "material": (rubro or "")[:120] or False, "description": cuerpo,
     }
+    if tel in VENTAS_TELEFONOS_PRUEBA:
+        vals.update({"user_id": False, "active": False, "name": "PRUEBA · " + vals["name"]})
     if SIMULAR:
         log.info("SIMULAR crm.lead.create (ventas) %s", vals)
         return {"lead_id": 0, "existia": False}
