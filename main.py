@@ -403,6 +403,30 @@ X_SECRET = Header(None, alias="X-CeVi-Secret")
 X_TOKEN = Header(None, alias="X-CeVi-Token")
 
 
+# ── URL firmada para el widget de voz ──────────────────────────────────────
+# El agente tiene la autenticación de ElevenLabs ACTIVADA: sin una URL firmada
+# nadie puede hablar con CeVi (ni copiar el agent_id para usarlo en otro sitio
+# y gastar los minutos de la cuenta). Solo quien trae un token de identidad
+# válido del portal (cliente con sesión) recibe una; dura 15 minutos para
+# iniciar la conversación, y el portal pide una nueva antes de cada llamada.
+ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "agent_3301m2v4ewgxf3sbrjs695yj3ct0")
+
+@app.post("/voz/url-firmada")
+async def voz_url_firmada(x_cevi_token: Optional[str] = X_TOKEN):
+    if not identidad.verificar_token(x_cevi_token):
+        return JSONResponse({"error": "sin sesión"}, status_code=401)
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    if not key:
+        return JSONResponse({"error": "voz no configurada"}, status_code=503)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get("https://api.elevenlabs.io/v1/convai/conversation/get-signed-url",
+                             params={"agent_id": ELEVENLABS_AGENT_ID}, headers={"xi-api-key": key})
+    if r.status_code != 200:
+        log.error("get-signed-url HTTP %s: %s", r.status_code, r.text[:200])
+        return JSONResponse({"error": "no se pudo iniciar la voz"}, status_code=502)
+    return {"signed_url": r.json().get("signed_url")}
+
+
 class BuscarClienteReq(BaseModel):
     telefono: Optional[str] = None
 
